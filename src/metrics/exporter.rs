@@ -56,7 +56,12 @@ pub struct Metrics {
 }
 
 impl Metrics {
-    pub fn new(network: String, rpc_url: String, identity_account: String, vote_account: String) -> Metrics {
+    pub fn new(
+        network: String,
+        rpc_url: String,
+        identity_account: String,
+        vote_account: String,
+    ) -> Metrics {
         Metrics {
             network,
             rpc_url,
@@ -81,7 +86,7 @@ impl Metrics {
 
     pub async fn init_registry(&self, shared_state: Arc<Mutex<AppState>>) {
         let mut state = shared_state.lock().await;
-        
+
         state
             .registry
             .register("solana_slot", "Slot of cluster", self.slot.clone());
@@ -164,8 +169,9 @@ impl Metrics {
             );
 
             // Create a channel for communicating current slot, epoch, and leader slots to background task
-            let (slot_tx, mut slot_rx) = tokio::sync::mpsc::unbounded_channel::<(u64, u64, Vec<u64>)>();
-            
+            let (slot_tx, mut slot_rx) =
+                tokio::sync::mpsc::unbounded_channel::<(u64, u64, Vec<u64>)>();
+
             // Spawn background task for block rewards fetching
             let mut bg_client = solana::validator::SolanaClient::new(
                 &self.rpc_url,
@@ -176,10 +182,13 @@ impl Metrics {
             tokio::spawn(async move {
                 while let Some((current_slot, current_epoch, leader_slots)) = slot_rx.recv().await {
                     if !leader_slots.is_empty() {
-                        match bg_client.get_block_rewards_sum(current_slot, current_epoch, leader_slots).await {
+                        match bg_client
+                            .get_block_rewards_sum(current_slot, current_epoch, leader_slots)
+                            .await
+                        {
                             Ok(block_rewards) => {
                                 bg_self.set_epoch_block_rewards(block_rewards);
-                                
+
                                 match bg_client.get_last_block_rewards().await {
                                     Ok(last_rewards) => {
                                         bg_self.set_last_block_rewards(last_rewards);
