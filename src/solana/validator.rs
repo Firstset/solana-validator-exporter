@@ -455,4 +455,38 @@ impl SolanaClient {
         }
         Ok(sum / 4)
     }
+
+    pub async fn get_voting_status(&self) -> Result<i64, Box<dyn std::error::Error + Send + Sync>> {
+        let vote_accounts = self
+            .client
+            .get_vote_accounts_with_config(RpcGetVoteAccountsConfig {
+                keep_unstaked_delinquents: Some(true),
+                delinquent_slot_distance: Some(125),
+                ..RpcGetVoteAccountsConfig::default()
+            })
+            .await?;
+
+        // Check if the vote account is in the current (non-delinquent) list
+        let is_current = vote_accounts
+            .current
+            .iter()
+            .any(|vote_account| vote_account.vote_pubkey == self.vote_account);
+
+        if is_current {
+            Ok(1) // Voting normally
+        } else {
+            // Check if it's in the delinquent list
+            let is_delinquent = vote_accounts
+                .delinquent
+                .iter()
+                .any(|vote_account| vote_account.vote_pubkey == self.vote_account);
+
+            if is_delinquent {
+                Ok(0) // Not voting due to delinquency
+            } else {
+                // Validator not found in either list - possibly not a validator or other issue
+                Ok(-1)
+            }
+        }
+    }
 }

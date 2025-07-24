@@ -52,6 +52,7 @@ pub struct Metrics {
     pub epoch_block_rewards: Family<MethodLabels, Gauge>,
     pub ms_to_next_slot: Family<MethodLabels, Gauge>,
     pub last_block_rewards: Family<MethodLabels, Gauge>,
+    pub voting_status: Family<MethodLabels, Gauge>,
 }
 
 impl Metrics {
@@ -74,6 +75,7 @@ impl Metrics {
             epoch_block_rewards: Family::default(),
             ms_to_next_slot: Family::default(),
             last_block_rewards: Family::default(),
+            voting_status: Family::default(),
         }
     }
 
@@ -144,6 +146,12 @@ impl Metrics {
             "solana_last_block_rewards",
             "Average of last non-zero block rewards",
             self.last_block_rewards.clone(),
+        );
+
+        state.registry.register(
+            "solana_voting_status",
+            "Validator voting status (-1=not found from the RPC response, 0=delinquent, 1=voting normally)",
+            self.voting_status.clone(),
         );
     }
 
@@ -330,6 +338,18 @@ impl Metrics {
 
                 if let Some(usd_price) = usd_price {
                     self.set_usd_price(usd_price);
+                }
+
+                let voting_status = match client.get_voting_status().await {
+                    Ok(status) => Some(status),
+                    Err(e) => {
+                        error!("Error fetching voting status: {}", e);
+                        None
+                    }
+                };
+
+                if let Some(voting_status) = voting_status {
+                    self.set_voting_status(voting_status);
                 }
 
                 // Sleep between metric updates
@@ -519,6 +539,15 @@ impl Metrics {
                 vote_account: self.vote_account.clone(),
             })
             .set(last_block_rewards);
+    }
+
+    pub fn set_voting_status(&self, status: i64) {
+        self.voting_status
+            .get_or_create(&MethodLabels {
+                network: self.network.clone(),
+                vote_account: self.vote_account.clone(),
+            })
+            .set(status);
     }
 }
 
