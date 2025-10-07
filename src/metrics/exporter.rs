@@ -7,66 +7,48 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use log::error;
 use prometheus_client::encoding::text::encode;
-use prometheus_client::encoding::EncodeLabelSet;
 use prometheus_client::metrics::family::Family;
 use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::registry::Registry;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
-pub struct MethodLabels {
-    pub network: String,
-    pub vote_account: String,
-}
-
-#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
-pub struct StakeLabels {
-    pub network: String,
-    pub stake_type: String,
-    pub vote_account: String,
-}
-
-#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
-pub struct BlockLabels {
-    pub network: String,
-    pub block_type: String,
-    pub vote_account: String,
-}
+type MetricLabels = Vec<(String, String)>;
 
 pub struct Metrics {
-    network: String,
     rpc_url: String,
     identity_account: String,
     vote_account: String,
-    pub slot: Family<MethodLabels, Gauge>,
-    pub epoch: Family<MethodLabels, Gauge>,
-    pub epoch_progress: Family<MethodLabels, Gauge>,
-    pub stake: Family<StakeLabels, Gauge>,
-    pub identity_balance: Family<MethodLabels, Gauge>,
-    pub vote_account_balance: Family<MethodLabels, Gauge>,
-    pub blocks: Family<BlockLabels, Gauge>,
-    pub jito_tips: Family<MethodLabels, Gauge>,
-    pub vote_credit_rank: Family<MethodLabels, Gauge>,
-    pub usd_price: Family<MethodLabels, Gauge>,
-    pub epoch_block_rewards: Family<MethodLabels, Gauge>,
-    pub ms_to_next_slot: Family<MethodLabels, Gauge>,
-    pub last_block_rewards: Family<MethodLabels, Gauge>,
-    pub voting_status: Family<MethodLabels, Gauge>,
+    static_labels: Arc<BTreeMap<String, String>>,
+    pub slot: Family<MetricLabels, Gauge>,
+    pub epoch: Family<MetricLabels, Gauge>,
+    pub epoch_progress: Family<MetricLabels, Gauge>,
+    pub stake: Family<MetricLabels, Gauge>,
+    pub identity_balance: Family<MetricLabels, Gauge>,
+    pub vote_account_balance: Family<MetricLabels, Gauge>,
+    pub blocks: Family<MetricLabels, Gauge>,
+    pub jito_tips: Family<MetricLabels, Gauge>,
+    pub vote_credit_rank: Family<MetricLabels, Gauge>,
+    pub usd_price: Family<MetricLabels, Gauge>,
+    pub epoch_block_rewards: Family<MetricLabels, Gauge>,
+    pub ms_to_next_slot: Family<MetricLabels, Gauge>,
+    pub last_block_rewards: Family<MetricLabels, Gauge>,
+    pub voting_status: Family<MetricLabels, Gauge>,
 }
 
 impl Metrics {
     pub fn new(
-        network: String,
         rpc_url: String,
         identity_account: String,
         vote_account: String,
+        labels: BTreeMap<String, String>,
     ) -> Metrics {
         Metrics {
-            network,
             rpc_url,
             identity_account,
             vote_account,
+            static_labels: Arc::new(labels),
             slot: Family::default(),
             epoch: Family::default(),
             epoch_progress: Family::default(),
@@ -371,205 +353,121 @@ impl Metrics {
     }
 
     pub fn set_slot(&self, slot: u64) {
-        self.slot
-            .get_or_create(&MethodLabels {
-                network: self.network.clone(),
-                vote_account: self.vote_account.clone(),
-            })
-            .set(slot as i64);
+        let labels = self.base_label_pairs();
+        self.slot.get_or_create(&labels).set(slot as i64);
     }
 
     pub fn set_epoch(&self, epoch: i64) {
-        self.epoch
-            .get_or_create(&MethodLabels {
-                network: self.network.clone(),
-                vote_account: self.vote_account.clone(),
-            })
-            .set(epoch);
+        let labels = self.base_label_pairs();
+        self.epoch.get_or_create(&labels).set(epoch);
     }
 
     pub fn set_epoch_progress(&self, progress: i64) {
-        self.epoch_progress
-            .get_or_create(&MethodLabels {
-                network: self.network.clone(),
-                vote_account: self.vote_account.clone(),
-            })
-            .set(progress);
+        let labels = self.base_label_pairs();
+        self.epoch_progress.get_or_create(&labels).set(progress);
     }
 
     pub fn set_stake(&self, stake_state: StakeState) {
-        self.stake
-            .get_or_create(&StakeLabels {
-                network: self.network.clone(),
-                stake_type: "activated".to_string(),
-                vote_account: self.vote_account.clone(),
-            })
-            .set(stake_state.activated_stake as i64);
-
-        self.stake
-            .get_or_create(&StakeLabels {
-                network: self.network.clone(),
-                stake_type: "activating".to_string(),
-                vote_account: self.vote_account.clone(),
-            })
-            .set(stake_state.activating_stake as i64);
-
-        self.stake
-            .get_or_create(&StakeLabels {
-                network: self.network.clone(),
-                stake_type: "deactivating".to_string(),
-                vote_account: self.vote_account.clone(),
-            })
-            .set(stake_state.deactivating_stake as i64);
-
-        self.stake
-            .get_or_create(&StakeLabels {
-                network: self.network.clone(),
-                stake_type: "locked".to_string(),
-                vote_account: self.vote_account.clone(),
-            })
-            .set(stake_state.locked_stake as i64);
-
-        self.stake
-            .get_or_create(&StakeLabels {
-                network: self.network.clone(),
-                stake_type: "activated_accounts".to_string(),
-                vote_account: self.vote_account.clone(),
-            })
-            .set(stake_state.activated_stake_accounts as i64);
-
-        self.stake
-            .get_or_create(&StakeLabels {
-                network: self.network.clone(),
-                stake_type: "activating_accounts".to_string(),
-                vote_account: self.vote_account.clone(),
-            })
-            .set(stake_state.activating_stake_accounts as i64);
-
-        self.stake
-            .get_or_create(&StakeLabels {
-                network: self.network.clone(),
-                stake_type: "deactivating_accounts".to_string(),
-                vote_account: self.vote_account.clone(),
-            })
-            .set(stake_state.deactivating_stake_accounts as i64);
+        self.set_stake_metric("activated", stake_state.activated_stake);
+        self.set_stake_metric("activating", stake_state.activating_stake);
+        self.set_stake_metric("deactivating", stake_state.deactivating_stake);
+        self.set_stake_metric("locked", stake_state.locked_stake);
+        self.set_stake_metric("activated_accounts", stake_state.activated_stake_accounts);
+        self.set_stake_metric("activating_accounts", stake_state.activating_stake_accounts);
+        self.set_stake_metric(
+            "deactivating_accounts",
+            stake_state.deactivating_stake_accounts,
+        );
     }
 
     pub fn set_identity_balance(&self, balance: u64) {
+        let labels = self.base_label_pairs();
         self.identity_balance
-            .get_or_create(&MethodLabels {
-                network: self.network.clone(),
-                vote_account: self.vote_account.clone(),
-            })
+            .get_or_create(&labels)
             .set(balance as i64);
     }
 
     pub fn set_vote_account_balance(&self, balance: u64) {
+        let labels = self.base_label_pairs();
         self.vote_account_balance
-            .get_or_create(&MethodLabels {
-                network: self.network.clone(),
-                vote_account: self.vote_account.clone(),
-            })
+            .get_or_create(&labels)
             .set(balance as i64);
     }
 
     pub fn set_block_scheduled(&self, scheduled: u64) {
-        self.blocks
-            .get_or_create(&BlockLabels {
-                network: self.network.clone(),
-                block_type: "scheduled".to_string(),
-                vote_account: self.vote_account.clone(),
-            })
-            .set(scheduled as i64);
+        self.set_block_metric("scheduled", scheduled);
     }
 
     pub fn set_block_production(&self, total: u64, produced: u64, skipped: u64) {
-        self.blocks
-            .get_or_create(&BlockLabels {
-                network: self.network.clone(),
-                block_type: "total".to_string(),
-                vote_account: self.vote_account.clone(),
-            })
-            .set(total as i64);
-
-        self.blocks
-            .get_or_create(&BlockLabels {
-                network: self.network.clone(),
-                block_type: "produced".to_string(),
-                vote_account: self.vote_account.clone(),
-            })
-            .set(produced as i64);
-
-        self.blocks
-            .get_or_create(&BlockLabels {
-                network: self.network.clone(),
-                block_type: "skipped".to_string(),
-                vote_account: self.vote_account.clone(),
-            })
-            .set(skipped as i64);
+        self.set_block_metric("total", total);
+        self.set_block_metric("produced", produced);
+        self.set_block_metric("skipped", skipped);
     }
 
     pub fn set_jito_tips(&self, tips: u64) {
-        self.jito_tips
-            .get_or_create(&MethodLabels {
-                network: self.network.clone(),
-                vote_account: self.vote_account.clone(),
-            })
-            .set(tips as i64);
+        let labels = self.base_label_pairs();
+        self.jito_tips.get_or_create(&labels).set(tips as i64);
     }
 
     pub fn set_vote_credit_rank(&self, rank: u32) {
+        let labels = self.base_label_pairs();
         self.vote_credit_rank
-            .get_or_create(&MethodLabels {
-                network: self.network.clone(),
-                vote_account: self.vote_account.clone(),
-            })
+            .get_or_create(&labels)
             .set(rank as i64);
     }
 
     pub fn set_usd_price(&self, price: i64) {
-        self.usd_price
-            .get_or_create(&MethodLabels {
-                network: self.network.clone(),
-                vote_account: self.vote_account.clone(),
-            })
-            .set(price);
+        let labels = self.base_label_pairs();
+        self.usd_price.get_or_create(&labels).set(price);
     }
 
     pub fn set_epoch_block_rewards(&self, block_rewards: i64) {
+        let labels = self.base_label_pairs();
         self.epoch_block_rewards
-            .get_or_create(&MethodLabels {
-                network: self.network.clone(),
-                vote_account: self.vote_account.clone(),
-            })
+            .get_or_create(&labels)
             .set(block_rewards);
     }
 
     pub fn set_ms_to_next_slot(&self, ms_to_next_slot: i64) {
+        let labels = self.base_label_pairs();
         self.ms_to_next_slot
-            .get_or_create(&MethodLabels {
-                network: self.network.clone(),
-                vote_account: self.vote_account.clone(),
-            })
+            .get_or_create(&labels)
             .set(ms_to_next_slot);
     }
 
     pub fn set_last_block_rewards(&self, last_block_rewards: i64) {
+        let labels = self.base_label_pairs();
         self.last_block_rewards
-            .get_or_create(&MethodLabels {
-                network: self.network.clone(),
-                vote_account: self.vote_account.clone(),
-            })
+            .get_or_create(&labels)
             .set(last_block_rewards);
     }
 
     pub fn set_voting_status(&self, status: i64) {
-        self.voting_status
-            .get_or_create(&MethodLabels {
-                network: self.network.clone(),
-                vote_account: self.vote_account.clone(),
-            })
-            .set(status);
+        let labels = self.base_label_pairs();
+        self.voting_status.get_or_create(&labels).set(status);
+    }
+
+    fn set_stake_metric(&self, stake_type: &str, value: u64) {
+        let labels = self.labels_with("stake_type", stake_type);
+        self.stake.get_or_create(&labels).set(value as i64);
+    }
+
+    fn set_block_metric(&self, block_type: &str, value: u64) {
+        let labels = self.labels_with("block_type", block_type);
+        self.blocks.get_or_create(&labels).set(value as i64);
+    }
+
+    fn base_label_pairs(&self) -> MetricLabels {
+        self.static_labels
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect()
+    }
+
+    fn labels_with(&self, key: &str, value: impl Into<String>) -> MetricLabels {
+        let mut labels = self.base_label_pairs();
+        labels.push((key.to_string(), value.into()));
+        labels
     }
 }
 
