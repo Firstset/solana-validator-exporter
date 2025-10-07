@@ -40,6 +40,8 @@ struct NetworkConfig {
 struct NetworkValidator {
     vote_address: String,
     identity_address: String,
+    #[serde(default)]
+    labels: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone)]
@@ -80,6 +82,9 @@ async fn main() {
                 .entry("network".to_string())
                 .or_insert(network_name.clone());
             labels.insert("vote_account".to_string(), validator.vote_address.clone());
+
+            // Iterate validator.labels and insert into labels, overriding any existing keys
+            labels.extend(validator.labels.clone());
 
             validator_configs.push(ValidatorConfig {
                 network_key: network_name.clone(),

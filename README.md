@@ -46,7 +46,7 @@ This is a Prometheus exporter for Solana validators that supports monitoring mul
     - `validators`: A list of validator objects with `vote_address` and `identity_address` keys.
     - `labels` _(optional)_: Additional key/value pairs that will be attached to every metric for that network.
 
-    The exporter automatically adds `network` and `vote_account` labels. If you supply a `network` entry inside `labels`, it overrides the default value derived from the config key.
+    The exporter automatically adds `network` and `vote_account` labels. If you supply a `network` entry inside `labels`, it overrides the default value derived from the config key. Note that you can also set labels for each validator, which overrides the values configured at the network level.
 
 ## Running the Exporter
 

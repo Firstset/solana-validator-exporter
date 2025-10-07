@@ -7,6 +7,9 @@ networks:
     validators:
       - vote_address: "YOUR_MAINNET_VOTE_ACCOUNT_PUBKEY"
         identity_address: "YOUR_MAINNET_IDENTITY_ACCOUNT_PUBKEY"
+        # optional and it overrides the network-level labels
+        labels:
+          description: "SOME_DETAILS_FOR_THIS_VALIDATOR"
       # - vote_address: "OPTIONAL_SECOND_MAINNET_VOTE_ACCOUNT"
       #   identity_address: "OPTIONAL_SECOND_MAINNET_IDENTITY_ACCOUNT"
     labels:
