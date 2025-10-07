@@ -418,9 +418,23 @@ impl SolanaClient {
             .collect();
         validator_credits.sort_by(|a, b| b.1.cmp(&a.1));
         let mut place = 0;
-        for (index, (vote_pubkey, _)) in validator_credits.iter().enumerate() {
+        let mut current_credits = None;
+        for (index, (vote_pubkey, credits)) in validator_credits.iter().enumerate() {
+            // Update rank only when credits change
+            match current_credits {
+                None => {
+                    current_credits = Some(*credits);
+                    place = 1;
+                }
+                Some(prev_credits) if prev_credits != *credits => {
+                    place = (index + 1) as u32;
+                    current_credits = Some(*credits);
+                }
+                _ => {
+                    // Same credits as previous, keep same rank
+                }
+            }
             if *vote_pubkey == *self.vote_account {
-                place = (index + 1) as u32;
                 break;
             }
         }
