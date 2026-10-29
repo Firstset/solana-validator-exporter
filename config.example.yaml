@@ -4,6 +4,12 @@ port: 9090
 networks:
   solana_mainnet:
     rpc_url: "https://api.mainnet-beta.solana.com"
+    # Optional timing settings, all in wall-clock seconds. They are converted to
+    # slots at runtime with the slot time measured from the RPC node
+    # (solana_slot_time_ms), so they keep their meaning when slot times change.
+    delinquency_seconds: 60        # last vote older than this => delinquent (floor: 32 slots)
+    reward_window_seconds: 900     # sliding window for solana_epoch_credits_rate_ratio
+    recent_window_seconds: 600     # lookback for fetching block rewards of leader slots
     validators:
       - vote_address: "YOUR_MAINNET_VOTE_ACCOUNT_PUBKEY"
         identity_address: "YOUR_MAINNET_IDENTITY_ACCOUNT_PUBKEY"
