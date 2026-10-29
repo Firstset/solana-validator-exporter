@@ -696,3 +696,141 @@ pub async fn metrics_handler(State(state): State<Arc<Mutex<AppState>>>) -> impl 
         .body(Body::from(body))
         .unwrap()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fixture_metrics() -> Metrics {
+        let mut labels = BTreeMap::new();
+        labels.insert("network".to_string(), "solana_mainnet".to_string());
+        labels.insert(
+            "vote_account".to_string(),
+            "Ours11111111111111111111111111111111111111111".to_string(),
+        );
+        labels.insert("stage".to_string(), "mainnet".to_string());
+        Metrics::new(
+            "http://localhost:8899".to_string(),
+            "OursIdentity11111111111111111111111111111111".to_string(),
+            "Ours11111111111111111111111111111111111111111".to_string(),
+            labels,
+            CollectorSettings {
+                delinquency_seconds: 60,
+                reward_window_seconds: 900,
+                recent_window_seconds: 600,
+            },
+        )
+    }
+
+    /// Sample lines inside one metric family come out of a HashMap, so sort them per block
+    /// to make the comparison deterministic.
+    fn normalize(body: &str) -> String {
+        let mut out = Vec::new();
+        let mut block: Vec<&str> = Vec::new();
+        for line in body.lines() {
+            if line.starts_with('#') {
+                block.sort_unstable();
+                out.append(&mut block);
+                out.push(line);
+            } else {
+                block.push(line);
+            }
+        }
+        block.sort_unstable();
+        out.append(&mut block);
+        out.join("\n") + "\n"
+    }
+
+    async fn render(metrics: &Metrics) -> String {
+        let state = Arc::new(Mutex::new(AppState {
+            registry: Registry::default(),
+        }));
+        metrics.init_registry(state.clone()).await;
+        let mut body = String::new();
+        encode(&mut body, &state.lock().await.registry).unwrap();
+        body
+    }
+
+    /// Snapshot of the full `/metrics` output: metric names, types, HELP text and label sets
+    /// must not change without updating `fixtures/metrics_snapshot.txt` deliberately.
+    #[tokio::test]
+    async fn metrics_output_matches_snapshot() {
+        let metrics = fixture_metrics();
+        metrics.set_slot(462_000_500);
+        metrics.set_epoch(1070);
+        metrics.set_epoch_progress(1234);
+        metrics.set_stake(StakeState {
+            activated_stake: 100_000,
+            activating_stake: 10,
+            deactivating_stake: 20,
+            locked_stake: 30,
+            activated_stake_accounts: 4,
+            activating_stake_accounts: 1,
+            deactivating_stake_accounts: 2,
+        });
+        metrics.set_identity_balance(5_000_000_000);
+        metrics.set_vote_account_balance(2_000_000_000);
+        metrics.set_block_scheduled(12);
+        metrics.set_block_production(10, 9, 1);
+        metrics.set_jito_tips(777);
+        metrics.set_usd_price(15_012_345);
+        metrics.set_epoch_block_rewards(123_456);
+        metrics.set_ms_to_next_slot(4_000);
+        metrics.set_last_block_rewards(11_111);
+        metrics.set_slot_time_ms(200);
+        metrics.set_bls_pubkey_registered(true);
+        metrics.set_vote_account_analysis(&VoteAccountAnalysis {
+            voting_status: 1,
+            vote_distance_slots: Some(3),
+            root_distance_slots: Some(35),
+            epoch_credits: 1_000,
+            vote_account_epoch: Some(1070),
+            activated_stake: 100_000,
+            credits_per_stake: Some(0.01),
+            cluster_median_credits_per_stake: Some(0.0105),
+            credits_per_stake_ratio: Some(0.95),
+            credits_percentile: Some(40.0),
+            vote_credit_rank: 2,
+        });
+        metrics.set_or_remove_f64(&metrics.epoch_credits_rate_ratio, Some(1.25));
+
+        let body = normalize(&render(&metrics).await);
+        let expected = normalize(include_str!("fixtures/metrics_snapshot.txt"));
+        assert_eq!(body, expected, "\n--- rendered /metrics ---\n{body}");
+    }
+
+    /// Metrics without a value are omitted instead of exporting a fake number.
+    #[tokio::test]
+    async fn optional_metrics_are_removed_when_unavailable() {
+        let metrics = fixture_metrics();
+        metrics.set_or_remove_f64(&metrics.epoch_credits_rate_ratio, Some(1.25));
+        metrics.set_vote_account_analysis(&VoteAccountAnalysis {
+            voting_status: -1,
+            vote_distance_slots: None,
+            root_distance_slots: None,
+            epoch_credits: 0,
+            vote_account_epoch: None,
+            activated_stake: 0,
+            credits_per_stake: None,
+            cluster_median_credits_per_stake: None,
+            credits_per_stake_ratio: None,
+            credits_percentile: None,
+            vote_credit_rank: 0,
+        });
+        metrics.set_or_remove_f64(&metrics.epoch_credits_rate_ratio, None);
+
+        let body = render(&metrics).await;
+        assert!(body.contains("solana_voting_status{"), "{body}");
+        assert!(body.contains("} -1\n"), "{body}");
+        for absent in [
+            "solana_vote_distance_slots{",
+            "solana_root_distance_slots{",
+            "solana_vote_account_epoch{",
+            "solana_epoch_credits_per_stake_ratio{",
+            "solana_epoch_credits_percentile{",
+            "solana_epoch_credits_rate_ratio{",
+        ] {
+            assert!(!body.contains(absent), "{absent} should be absent:\n{body}");
+        }
+    }
+}
