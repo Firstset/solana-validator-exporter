@@ -199,7 +199,7 @@ pub fn vote_credit_rank(
             (info.vote_pubkey.as_str(), credits)
         })
         .collect();
-    validator_credits.sort_by(|a, b| b.1.cmp(&a.1));
+    validator_credits.sort_by_key(|entry| std::cmp::Reverse(entry.1));
 
     let mut place = 0u32;
     let mut current_credits = None;
