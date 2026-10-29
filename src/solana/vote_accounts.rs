@@ -76,6 +76,14 @@ pub fn percentile(value: f64, population: &[f64]) -> Option<f64> {
     Some(100.0 * below as f64 / population.len() as f64)
 }
 
+/// Distance from an observed slot, clamped at zero if two sequential RPC reads straddle a slot
+/// boundary and at `i64::MAX` so it is always representable by the Prometheus gauge.
+fn slot_distance(current_slot: u64, observed_slot: u64) -> i64 {
+    current_slot
+        .saturating_sub(observed_slot)
+        .min(i64::MAX as u64) as i64
+}
+
 /// Result of analysing one `getVoteAccounts` snapshot for one vote account.
 #[derive(Debug, Clone, PartialEq)]
 pub struct VoteAccountAnalysis {
@@ -126,8 +134,8 @@ pub fn analyze(
         (None, None) => (VOTING_STATUS_NOT_FOUND, None),
     };
 
-    let vote_distance_slots = ours.map(|info| current_slot as i64 - info.last_vote as i64);
-    let root_distance_slots = ours.map(|info| current_slot as i64 - info.root_slot as i64);
+    let vote_distance_slots = ours.map(|info| slot_distance(current_slot, info.last_vote));
+    let root_distance_slots = ours.map(|info| slot_distance(current_slot, info.root_slot));
     let activated_stake = ours.map(|info| info.activated_stake).unwrap_or(0);
     let epoch_credits = ours
         .and_then(|info| current_epoch_credits(info, current_epoch))
@@ -380,6 +388,15 @@ mod tests {
         info.epoch_credits.push((EPOCH + 1, 9_000, 8_000));
         assert_eq!(current_epoch_credits(&info, EPOCH), Some(1_000));
         assert_eq!(latest_epoch_credits(&info, EPOCH), Some((EPOCH, 1_000)));
+    }
+
+    #[test]
+    fn slot_distances_never_go_negative_when_rpc_reads_straddle_a_slot() {
+        let status = fixture();
+        let ours = account(&status, "Ours11111111111111111111111111111111111111111");
+        let analysis = analyze(&status, &ours.vote_pubkey, EPOCH, ours.last_vote - 1);
+        assert_eq!(analysis.vote_distance_slots, Some(0));
+        assert!(analysis.root_distance_slots.unwrap() >= 0);
     }
 
     #[test]

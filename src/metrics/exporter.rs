@@ -320,8 +320,21 @@ impl Metrics {
                 let delinquent_slot_distance =
                     validator::delinquency_slots(self.settings.delinquency_seconds, slot_time_ms);
 
-                // getSlot immediately before getVoteAccounts so that the vote/root distances are
-                // measured against the same node's view of the current slot.
+                // Fetch vote accounts before the reference slot. At 200 ms per slot the bank can
+                // advance during getVoteAccounts, so a slot fetched first can be older than the
+                // response's lastVote.
+                let vote_accounts = if epoch_info.is_some() {
+                    match client.get_vote_accounts(delinquent_slot_distance).await {
+                        Ok(status) => Some(status),
+                        Err(e) => {
+                            error!("Error fetching vote accounts: {}", e);
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+
                 let slot = match client.get_slot().await {
                     Ok(s) => Some(s),
                     Err(e) => {
@@ -334,25 +347,19 @@ impl Metrics {
                     self.set_slot(slot);
                 }
 
-                // Single getVoteAccounts call per iteration; everything vote-related derives from it.
-                if let (Some(current_slot), Some((epoch, _))) = (slot, epoch_info) {
-                    match client.get_vote_accounts(delinquent_slot_distance).await {
-                        Ok(status) => {
-                            let analysis = vote_accounts::analyze(
-                                &status,
-                                &self.vote_account,
-                                epoch as u64,
-                                current_slot,
-                            );
-                            self.set_vote_account_analysis(&analysis);
-                            let rate_ratio =
-                                reward_window.push(unix_time_secs(), epoch as u64, &analysis);
-                            self.set_or_remove_f64(&self.epoch_credits_rate_ratio, rate_ratio);
-                        }
-                        Err(e) => {
-                            error!("Error fetching vote accounts: {}", e);
-                        }
-                    }
+                // Everything vote-related derives from the single snapshot fetched above.
+                if let (Some(status), Some(current_slot), Some((epoch, _))) =
+                    (vote_accounts, slot, epoch_info)
+                {
+                    let analysis = vote_accounts::analyze(
+                        &status,
+                        &self.vote_account,
+                        epoch as u64,
+                        current_slot,
+                    );
+                    self.set_vote_account_analysis(&analysis);
+                    let rate_ratio = reward_window.push(unix_time_secs(), epoch as u64, &analysis);
+                    self.set_or_remove_f64(&self.epoch_credits_rate_ratio, rate_ratio);
                 }
 
                 if let Some(epoch_info) = epoch_info {
