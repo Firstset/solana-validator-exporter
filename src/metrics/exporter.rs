@@ -1,5 +1,5 @@
 use crate::solana;
-use crate::solana::validator::StakeState;
+use crate::solana::validator::{self, StakeState};
 use axum::body::Body;
 use axum::extract::State;
 use axum::http::header::CONTENT_TYPE;
@@ -48,6 +48,7 @@ pub struct Metrics {
     pub ms_to_next_slot: Family<MetricLabels, Gauge>,
     pub last_block_rewards: Family<MetricLabels, Gauge>,
     pub voting_status: Family<MetricLabels, Gauge>,
+    pub slot_time_ms: Family<MetricLabels, Gauge>,
 }
 
 impl Metrics {
@@ -78,6 +79,7 @@ impl Metrics {
             ms_to_next_slot: Family::default(),
             last_block_rewards: Family::default(),
             voting_status: Family::default(),
+            slot_time_ms: Family::default(),
         }
     }
 
@@ -155,6 +157,12 @@ impl Metrics {
             "Validator voting status (-1=not found from the RPC response, 0=delinquent, 1=voting normally)",
             self.voting_status.clone(),
         );
+
+        state.registry.register(
+            "solana_slot_time_ms",
+            "Average slot time in milliseconds measured from recent performance samples; used for every slot/time conversion in this exporter",
+            self.slot_time_ms.clone(),
+        );
     }
 
     pub fn run_loop(self: Arc<Self>) -> tokio::task::JoinHandle<()> {
@@ -165,9 +173,10 @@ impl Metrics {
                 &self.vote_account,
             );
 
-            // Create a channel for communicating current slot, epoch, and leader slots to background task
+            // Create a channel for communicating current slot, epoch, leader slots and the
+            // recent-slot window to the background task
             let (slot_tx, mut slot_rx) =
-                tokio::sync::mpsc::unbounded_channel::<(u64, u64, Vec<u64>)>();
+                tokio::sync::mpsc::unbounded_channel::<(u64, u64, Vec<u64>, u64)>();
 
             // Spawn background task for block rewards fetching
             let mut bg_client = solana::validator::SolanaClient::new(
@@ -177,10 +186,17 @@ impl Metrics {
             );
             let bg_self = self.clone();
             tokio::spawn(async move {
-                while let Some((current_slot, current_epoch, leader_slots)) = slot_rx.recv().await {
+                while let Some((current_slot, current_epoch, leader_slots, recent_window_slots)) =
+                    slot_rx.recv().await
+                {
                     if !leader_slots.is_empty() {
                         match bg_client
-                            .get_block_rewards_sum(current_slot, current_epoch, leader_slots)
+                            .get_block_rewards_sum(
+                                current_slot,
+                                current_epoch,
+                                leader_slots,
+                                recent_window_slots,
+                            )
                             .await
                         {
                             Ok(block_rewards) => {
@@ -224,6 +240,22 @@ impl Metrics {
                     }
                 };
 
+                // Measured slot time drives every slot/time conversion below.
+                let slot_time_ms = match client.get_slot_time_ms().await {
+                    Ok(ms) => ms,
+                    Err(e) => {
+                        error!(
+                            "Error fetching performance samples: {}; assuming {} ms slots",
+                            e,
+                            validator::DEFAULT_SLOT_TIME_MS
+                        );
+                        validator::DEFAULT_SLOT_TIME_MS
+                    }
+                };
+                self.set_slot_time_ms(slot_time_ms);
+                let recent_window_slots =
+                    validator::seconds_to_slots(self.settings.recent_window_seconds, slot_time_ms);
+
                 if let Some(epoch_info) = epoch_info {
                     let (epoch, epoch_progress) = epoch_info;
                     self.set_epoch(epoch);
@@ -250,25 +282,21 @@ impl Metrics {
                         }
                     };
 
-                    let _ = slot_tx.send((slot.unwrap_or(0), epoch as u64, leader_slots.clone()));
+                    let _ = slot_tx.send((
+                        slot.unwrap_or(0),
+                        epoch as u64,
+                        leader_slots.clone(),
+                        recent_window_slots,
+                    ));
 
                     // Update solana_blocks{block_type="scheduled"}
                     self.set_block_scheduled(leader_slots.len() as u64);
 
-                    let next_slot_ms = match client
-                        .get_ms_to_next_slot(slot.unwrap_or(0), leader_slots)
-                        .await
-                    {
-                        Ok(ms) => Some(ms),
-                        Err(e) => {
-                            error!("Error fetching ms to next slot: {}", e);
-                            None
-                        }
-                    };
-
-                    if let Some(next_slot_ms) = next_slot_ms {
-                        self.set_ms_to_next_slot(next_slot_ms);
-                    }
+                    self.set_ms_to_next_slot(validator::ms_to_next_slot(
+                        slot.unwrap_or(0),
+                        &leader_slots,
+                        slot_time_ms,
+                    ));
                 }
 
                 let stake_details = match client.get_stake_details().await {
@@ -460,6 +488,13 @@ impl Metrics {
     pub fn set_voting_status(&self, status: i64) {
         let labels = self.base_label_pairs();
         self.voting_status.get_or_create(&labels).set(status);
+    }
+
+    pub fn set_slot_time_ms(&self, slot_time_ms: u64) {
+        let labels = self.base_label_pairs();
+        self.slot_time_ms
+            .get_or_create(&labels)
+            .set(slot_time_ms as i64);
     }
 
     fn set_stake_metric(&self, stake_type: &str, value: u64) {
