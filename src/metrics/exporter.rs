@@ -1,5 +1,6 @@
 use crate::solana;
 use crate::solana::validator::{self, StakeState};
+use crate::solana::vote_accounts::{self, VoteAccountAnalysis};
 use axum::body::Body;
 use axum::extract::State;
 use axum::http::header::CONTENT_TYPE;
@@ -11,10 +12,12 @@ use prometheus_client::metrics::family::Family;
 use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::registry::Registry;
 use std::collections::BTreeMap;
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
 type MetricLabels = Vec<(String, String)>;
+type FloatGauge = Gauge<f64, AtomicU64>;
 
 /// Per-network collection settings, all expressed in wall-clock seconds and
 /// converted to slots at runtime with the measured slot time.
@@ -49,6 +52,12 @@ pub struct Metrics {
     pub last_block_rewards: Family<MetricLabels, Gauge>,
     pub voting_status: Family<MetricLabels, Gauge>,
     pub slot_time_ms: Family<MetricLabels, Gauge>,
+    pub vote_distance_slots: Family<MetricLabels, Gauge>,
+    pub root_distance_slots: Family<MetricLabels, Gauge>,
+    pub epoch_credits: Family<MetricLabels, Gauge>,
+    pub epoch_credits_per_stake_ratio: Family<MetricLabels, FloatGauge>,
+    pub epoch_credits_percentile: Family<MetricLabels, FloatGauge>,
+    pub vote_account_epoch: Family<MetricLabels, Gauge>,
 }
 
 impl Metrics {
@@ -80,6 +89,12 @@ impl Metrics {
             last_block_rewards: Family::default(),
             voting_status: Family::default(),
             slot_time_ms: Family::default(),
+            vote_distance_slots: Family::default(),
+            root_distance_slots: Family::default(),
+            epoch_credits: Family::default(),
+            epoch_credits_per_stake_ratio: Family::default(),
+            epoch_credits_percentile: Family::default(),
+            vote_account_epoch: Family::default(),
         }
     }
 
@@ -116,9 +131,11 @@ impl Metrics {
             self.vote_account_balance.clone(),
         );
 
-        state
-            .registry
-            .register("solana_blocks", "Block production", self.blocks.clone());
+        state.registry.register(
+            "solana_blocks",
+            "Block production. 0 scheduled slots with non-zero activated stake means the validator was not admitted to the epoch's leader schedule (VAT or missing BLS pubkey)",
+            self.blocks.clone(),
+        );
 
         state
             .registry
@@ -126,7 +143,7 @@ impl Metrics {
 
         state.registry.register(
             "solana_vote_credit_rank",
-            "Vote credit rank",
+            "DEPRECATED since Alpenglow: epoch credits are reward lamports proportional to stake, so this ranks by stake. Use solana_epoch_credits_rate_ratio / solana_epoch_credits_percentile instead. Will be removed in the next release",
             self.vote_credit_rank.clone(),
         );
 
@@ -162,6 +179,42 @@ impl Metrics {
             "solana_slot_time_ms",
             "Average slot time in milliseconds measured from recent performance samples; used for every slot/time conversion in this exporter",
             self.slot_time_ms.clone(),
+        );
+
+        state.registry.register(
+            "solana_vote_distance_slots",
+            "Current slot minus the vote account's lastVote, from one getVoteAccounts/getSlot pair on the same RPC node",
+            self.vote_distance_slots.clone(),
+        );
+
+        state.registry.register(
+            "solana_root_distance_slots",
+            "Current slot minus the vote account's rootSlot, from one getVoteAccounts/getSlot pair on the same RPC node",
+            self.root_distance_slots.clone(),
+        );
+
+        state.registry.register(
+            "solana_epoch_credits",
+            "Credits earned in the current epoch (reward lamports since Alpenglow); 0 if the account has no entry for the current epoch",
+            self.epoch_credits.clone(),
+        );
+
+        state.registry.register(
+            "solana_epoch_credits_per_stake_ratio",
+            "Epoch-to-date credits per activated stake divided by the cluster median over staked accounts with a current-epoch entry (1.0 = median)",
+            self.epoch_credits_per_stake_ratio.clone(),
+        );
+
+        state.registry.register(
+            "solana_epoch_credits_percentile",
+            "Percentage (0-100) of staked vote accounts whose epoch-to-date credits per stake is strictly below ours; accounts without a current-epoch entry count as 0",
+            self.epoch_credits_percentile.clone(),
+        );
+
+        state.registry.register(
+            "solana_vote_account_epoch",
+            "Epoch of the newest usable epochCredits entry; lags solana_epoch when the vote account or the RPC node is stale",
+            self.vote_account_epoch.clone(),
         );
     }
 
@@ -255,6 +308,26 @@ impl Metrics {
                 self.set_slot_time_ms(slot_time_ms);
                 let recent_window_slots =
                     validator::seconds_to_slots(self.settings.recent_window_seconds, slot_time_ms);
+                let delinquent_slot_distance =
+                    validator::delinquency_slots(self.settings.delinquency_seconds, slot_time_ms);
+
+                // Single getVoteAccounts call per iteration; everything vote-related derives from it.
+                if let (Some(current_slot), Some((epoch, _))) = (slot, epoch_info) {
+                    match client.get_vote_accounts(delinquent_slot_distance).await {
+                        Ok(status) => {
+                            let analysis = vote_accounts::analyze(
+                                &status,
+                                &self.vote_account,
+                                epoch as u64,
+                                current_slot,
+                            );
+                            self.set_vote_account_analysis(&analysis);
+                        }
+                        Err(e) => {
+                            error!("Error fetching vote accounts: {}", e);
+                        }
+                    }
+                }
 
                 if let Some(epoch_info) = epoch_info {
                     let (epoch, epoch_progress) = epoch_info;
@@ -353,18 +426,6 @@ impl Metrics {
                     );
                 }
 
-                let vote_credit_rank = match client.get_vote_credit_rank().await {
-                    Ok(r) => Some(r),
-                    Err(e) => {
-                        error!("Error fetching vote credit rank: {}", e);
-                        None
-                    }
-                };
-
-                if let Some(vote_credit_rank) = vote_credit_rank {
-                    self.set_vote_credit_rank(vote_credit_rank);
-                }
-
                 let usd_price = match client.get_sol_usd_price().await {
                     Ok(p) => Some(p),
                     Err(e) => {
@@ -375,18 +436,6 @@ impl Metrics {
 
                 if let Some(usd_price) = usd_price {
                     self.set_usd_price(usd_price);
-                }
-
-                let voting_status = match client.get_voting_status().await {
-                    Ok(status) => Some(status),
-                    Err(e) => {
-                        error!("Error fetching voting status: {}", e);
-                        None
-                    }
-                };
-
-                if let Some(voting_status) = voting_status {
-                    self.set_voting_status(voting_status);
                 }
 
                 // Sleep between metric updates
@@ -488,6 +537,56 @@ impl Metrics {
     pub fn set_voting_status(&self, status: i64) {
         let labels = self.base_label_pairs();
         self.voting_status.get_or_create(&labels).set(status);
+    }
+
+    pub fn set_vote_account_analysis(&self, analysis: &VoteAccountAnalysis) {
+        self.set_voting_status(analysis.voting_status);
+        self.set_vote_credit_rank(analysis.vote_credit_rank);
+        self.set_epoch_credits(analysis.epoch_credits);
+        self.set_or_remove_i64(&self.vote_distance_slots, analysis.vote_distance_slots);
+        self.set_or_remove_i64(&self.root_distance_slots, analysis.root_distance_slots);
+        self.set_or_remove_i64(
+            &self.vote_account_epoch,
+            analysis.vote_account_epoch.map(|epoch| epoch as i64),
+        );
+        self.set_or_remove_f64(
+            &self.epoch_credits_per_stake_ratio,
+            analysis.credits_per_stake_ratio,
+        );
+        self.set_or_remove_f64(&self.epoch_credits_percentile, analysis.credits_percentile);
+    }
+
+    pub fn set_epoch_credits(&self, credits: u64) {
+        let labels = self.base_label_pairs();
+        self.epoch_credits
+            .get_or_create(&labels)
+            .set(credits.min(i64::MAX as u64) as i64);
+    }
+
+    /// Set the gauge, or drop its sample when there is no value to report.
+    fn set_or_remove_i64(&self, family: &Family<MetricLabels, Gauge>, value: Option<i64>) {
+        let labels = self.base_label_pairs();
+        match value {
+            Some(v) => {
+                family.get_or_create(&labels).set(v);
+            }
+            None => {
+                family.remove(&labels);
+            }
+        }
+    }
+
+    /// Set the gauge, or drop its sample when there is no value to report (NaN/omitted).
+    fn set_or_remove_f64(&self, family: &Family<MetricLabels, FloatGauge>, value: Option<f64>) {
+        let labels = self.base_label_pairs();
+        match value {
+            Some(v) if v.is_finite() => {
+                family.get_or_create(&labels).set(v);
+            }
+            _ => {
+                family.remove(&labels);
+            }
+        }
     }
 
     pub fn set_slot_time_ms(&self, slot_time_ms: u64) {

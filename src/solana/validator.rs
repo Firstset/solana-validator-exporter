@@ -8,7 +8,7 @@ use solana_rpc_client_api::config::{
     RpcAccountInfoConfig, RpcBlockConfig, RpcGetVoteAccountsConfig, RpcProgramAccountsConfig,
 };
 use solana_rpc_client_api::filter::{Memcmp, RpcFilterType};
-use solana_rpc_client_api::response::RpcPerfSample;
+use solana_rpc_client_api::response::{RpcPerfSample, RpcVoteAccountStatus};
 use solana_sdk::account_utils::StateMut;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::stake;
@@ -463,57 +463,6 @@ impl SolanaClient {
         Ok(balance)
     }
 
-    pub async fn get_vote_credit_rank(
-        &self,
-    ) -> Result<u32, Box<dyn std::error::Error + Send + Sync>> {
-        let vote_accounts = self
-            .client
-            .get_vote_accounts_with_config(RpcGetVoteAccountsConfig {
-                keep_unstaked_delinquents: Some(false),
-                delinquent_slot_distance: Some(125),
-                ..RpcGetVoteAccountsConfig::default()
-            })
-            .await?;
-        let mut validator_credits: Vec<_> = vote_accounts
-            .current
-            .iter()
-            .map(|vote_account| {
-                let current_epoch = &vote_account.epoch_credits.last();
-                if let Some((_, credits, prev_credits)) = current_epoch {
-                    (
-                        vote_account.vote_pubkey.clone(),
-                        credits.saturating_sub(*prev_credits),
-                    )
-                } else {
-                    (vote_account.vote_pubkey.clone(), 0)
-                }
-            })
-            .collect();
-        validator_credits.sort_by(|a, b| b.1.cmp(&a.1));
-        let mut place = 0;
-        let mut current_credits = None;
-        for (index, (vote_pubkey, credits)) in validator_credits.iter().enumerate() {
-            // Update rank only when credits change
-            match current_credits {
-                None => {
-                    current_credits = Some(*credits);
-                    place = 1;
-                }
-                Some(prev_credits) if prev_credits != *credits => {
-                    place = (index + 1) as u32;
-                    current_credits = Some(*credits);
-                }
-                _ => {
-                    // Same credits as previous, keep same rank
-                }
-            }
-            if *vote_pubkey == *self.vote_account {
-                break;
-            }
-        }
-        Ok(place)
-    }
-
     pub async fn get_sol_usd_price(&self) -> Result<i64, Box<dyn std::error::Error + Send + Sync>> {
         debug!("Fetching sol price from kraken");
         let resp = reqwest::get("https://api.kraken.com/0/public/Ticker?pair=SOLUSD").await?;
@@ -549,38 +498,22 @@ impl SolanaClient {
         Ok(sum / 4)
     }
 
-    pub async fn get_voting_status(&self) -> Result<i64, Box<dyn std::error::Error + Send + Sync>> {
+    /// One `getVoteAccounts` call per loop iteration, keeping unstaked delinquents so that
+    /// voting status, vote/root distances, credits and cluster statistics all come from the
+    /// same response. `delinquent_slot_distance` is derived from `delinquency_seconds`.
+    pub async fn get_vote_accounts(
+        &self,
+        delinquent_slot_distance: u64,
+    ) -> Result<RpcVoteAccountStatus, Box<dyn std::error::Error + Send + Sync>> {
         let vote_accounts = self
             .client
             .get_vote_accounts_with_config(RpcGetVoteAccountsConfig {
                 keep_unstaked_delinquents: Some(true),
-                delinquent_slot_distance: Some(125),
+                delinquent_slot_distance: Some(delinquent_slot_distance),
                 ..RpcGetVoteAccountsConfig::default()
             })
             .await?;
-
-        // Check if the vote account is in the current (non-delinquent) list
-        let is_current = vote_accounts
-            .current
-            .iter()
-            .any(|vote_account| vote_account.vote_pubkey == self.vote_account);
-
-        if is_current {
-            Ok(1) // Voting normally
-        } else {
-            // Check if it's in the delinquent list
-            let is_delinquent = vote_accounts
-                .delinquent
-                .iter()
-                .any(|vote_account| vote_account.vote_pubkey == self.vote_account);
-
-            if is_delinquent {
-                Ok(0) // Not voting due to delinquency
-            } else {
-                // Validator not found in either list - possibly not a validator or other issue
-                Ok(-1)
-            }
-        }
+        Ok(vote_accounts)
     }
 }
 
