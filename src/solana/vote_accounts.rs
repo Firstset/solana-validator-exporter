@@ -294,11 +294,14 @@ impl RewardRateWindow {
             our_credits: analysis.epoch_credits,
             cluster_median_credits_per_stake: median,
         });
-        while self
-            .snapshots
-            .front()
-            .is_some_and(|first| timestamp_secs - first.timestamp_secs > self.window_seconds)
-        {
+        // Keep the newest snapshot that is already outside the window, so the covered span
+        // is always at least `window_seconds` once enough history exists. Dropping every
+        // snapshot older than the window would leave a span of one poll interval for small
+        // windows and never reach MIN_RATE_WINDOW_SECONDS.
+        let outside_window = |snapshot: &RateSnapshot| {
+            timestamp_secs - snapshot.timestamp_secs > self.window_seconds
+        };
+        while self.snapshots.get(1).is_some_and(outside_window) {
             self.snapshots.pop_front();
         }
 
@@ -641,13 +644,14 @@ mod tests {
         window.push(0, EPOCH, &staked_analysis(0, 0.0));
         window.push(600, EPOCH, &staked_analysis(600, 0.006));
         window.push(1_200, EPOCH, &staked_analysis(1_200, 0.012));
-        // The snapshot at t=0 is older than 900 s and has been dropped.
-        assert_eq!(window.len(), 2);
-        // At t=1800 the t=600 snapshot slides out as well; the window is [1200, 1800].
+        // t=0 is outside the window but stays as the boundary snapshot, so the covered span
+        // (1200 s) is at least the configured 900 s.
+        assert_eq!(window.len(), 3);
+        // At t=1800 both t=0 and t=600 are outside the window; t=600 stays as the boundary.
         let ratio = window.push(1_800, EPOCH, &staked_analysis(1_500, 0.018));
-        assert_eq!(window.len(), 2);
-        // Since t=1200: ours 300 / 100_000 = 0.003; median 0.006 => 0.5
-        assert_close(ratio, 0.5);
+        assert_eq!(window.len(), 3);
+        // Since t=600: ours 900 / 100_000 = 0.009; median 0.012 => 0.75
+        assert_close(ratio, 0.75);
 
         // New epoch: history is discarded and no sample is reported.
         assert_eq!(
@@ -655,6 +659,28 @@ mod tests {
             None
         );
         assert_eq!(window.len(), 1);
+    }
+
+    #[test]
+    fn minimum_window_emits_with_realistic_poll_spacing() {
+        // reward_window_seconds at its minimum of 60 with snapshots every 35 s
+        // (30 s sleep plus the loop's own RPC time) must still produce samples.
+        let mut window = RewardRateWindow::new(60);
+        let mut emitted = Vec::new();
+        for i in 0..6u64 {
+            let t = i * 35;
+            let ratio = window.push(t, EPOCH, &staked_analysis(t * 10, t as f64 * 0.0001));
+            emitted.push(ratio);
+        }
+        // First sample at t=70 (span 70 s >= 60), then every push.
+        assert_eq!(emitted[0], None);
+        assert_eq!(emitted[1], None);
+        for ratio in &emitted[2..] {
+            // Ours: 10 credits/s on 100_000 stake = 0.0001 per stake per s; median 0.0001/s => 1.0
+            assert_close(*ratio, 1.0);
+        }
+        // Never more than one boundary snapshot plus those inside the window.
+        assert_eq!(window.len(), 3);
     }
 
     #[test]
