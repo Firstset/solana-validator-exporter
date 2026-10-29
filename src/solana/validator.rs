@@ -18,6 +18,8 @@ use solana_sdk::sysvar;
 use solana_sdk::sysvar::clock::Clock;
 use solana_sdk::sysvar::stake_history;
 use std::collections::HashMap;
+
+use crate::solana::vote_accounts::LeaderSchedule;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio;
 
@@ -265,9 +267,11 @@ impl SolanaClient {
             .await?;
         Ok(balance)
     }
-    pub async fn get_leader_info(
+    /// Leader schedule of the current epoch as identity => absolute leader slots. The schedule
+    /// is fixed for the epoch, so callers cache it and refetch only when the epoch changes.
+    pub async fn get_leader_schedule(
         &self,
-    ) -> Result<Vec<u64>, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<LeaderSchedule, Box<dyn std::error::Error + Send + Sync>> {
         let epoch_info = self.client.get_epoch_info().await?;
         let epoch_schedule = self.client.get_epoch_schedule().await?;
         let first_slot_in_epoch = epoch_schedule.get_first_slot_in_epoch(epoch_info.epoch);
@@ -275,20 +279,18 @@ impl SolanaClient {
             .client
             .get_leader_schedule(Some(first_slot_in_epoch))
             .await?
-            .ok_or_else(|| "Error parsing leader schedule")?;
+            .ok_or("Error parsing leader schedule")?;
 
-        let my_leader_slots = leader_schedule
-            .iter()
-            .filter(|(pubkey, _)| **pubkey == self.identity_account)
-            .next();
-
-        let mut leader_slots: Vec<u64> = Vec::new();
-        for (_, slots) in my_leader_slots.iter() {
-            for slot_index in slots.iter() {
-                leader_slots.push(*slot_index as u64 + first_slot_in_epoch)
-            }
-        }
-        Ok(leader_slots)
+        Ok(leader_schedule
+            .into_iter()
+            .map(|(identity, slot_indexes)| {
+                let slots = slot_indexes
+                    .into_iter()
+                    .map(|index| index as u64 + first_slot_in_epoch)
+                    .collect();
+                (identity, slots)
+            })
+            .collect())
     }
 
     pub async fn get_block_production(

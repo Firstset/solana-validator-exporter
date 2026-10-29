@@ -1,6 +1,8 @@
 use crate::solana;
 use crate::solana::validator::{self, StakeState};
-use crate::solana::vote_accounts::{self, RewardRate, RewardRateWindow, VoteAccountAnalysis};
+use crate::solana::vote_accounts::{
+    self, LeaderSchedule, RateReference, RewardRate, RewardRateWindow, VoteAccountAnalysis,
+};
 use axum::body::Body;
 use axum::extract::State;
 use axum::http::header::CONTENT_TYPE;
@@ -60,6 +62,7 @@ pub struct Metrics {
     pub epoch_credits_rate_ratio: Family<MetricLabels, FloatGauge>,
     pub epoch_credits_rate_percentile: Family<MetricLabels, FloatGauge>,
     pub leader_slots_in_window: Family<MetricLabels, Gauge>,
+    pub rate_reference_accounts: Family<MetricLabels, Gauge>,
     pub vote_account_epoch: Family<MetricLabels, Gauge>,
     pub bls_pubkey_registered: Family<MetricLabels, Gauge>,
 }
@@ -101,6 +104,7 @@ impl Metrics {
             epoch_credits_rate_ratio: Family::default(),
             epoch_credits_rate_percentile: Family::default(),
             leader_slots_in_window: Family::default(),
+            rate_reference_accounts: Family::default(),
             vote_account_epoch: Family::default(),
             bls_pubkey_registered: Family::default(),
         }
@@ -221,7 +225,7 @@ impl Metrics {
 
         state.registry.register(
             "solana_epoch_credits_rate_ratio",
-            "Credits per stake earned over the last reward_window_seconds divided by the cluster median of the same per-account quantity (1.0 = median); our own leader slots inflate it for one window; absent until the window holds two snapshots at least 60 s apart",
+            "Credits per stake earned over the last reward_window_seconds divided by the median of the same per-account quantity over accounts with no leader slot inside the window (1.0 = median; p10 of all accounts when fewer than 50 such accounts exist); our own leader slots inflate it for one window; absent until the window holds two snapshots at least 60 s apart",
             self.epoch_credits_rate_ratio.clone(),
         );
 
@@ -235,6 +239,12 @@ impl Metrics {
             "solana_leader_slots_in_window",
             "Number of our scheduled leader slots inside the reward_window_seconds window; leader rewards make solana_epoch_credits_rate_ratio spike above 1 when this is non-zero",
             self.leader_slots_in_window.clone(),
+        );
+
+        state.registry.register(
+            "solana_rate_reference_accounts",
+            "Number of staked vote accounts that earned credits in the reward window and had no leader slot inside it: the reference population of solana_epoch_credits_rate_ratio; below 50 the ratio falls back to the 10th percentile of all accounts",
+            self.rate_reference_accounts.clone(),
         );
 
         state.registry.register(
@@ -305,6 +315,10 @@ impl Metrics {
             });
 
             let mut reward_window = RewardRateWindow::new(self.settings.reward_window_seconds);
+            // The leader schedule is fixed for an epoch: fetched once per epoch, it serves the
+            // reward window's reference population and our own leader slots.
+            let mut leader_schedule_cache: Option<(u64, LeaderSchedule)> = None;
+            let mut rate_fallback_logged_epoch: Option<u64> = None;
             // BLS registration is checked once per epoch; a missing field is logged once.
             let mut bls_checked_epoch: Option<u64> = None;
             let mut bls_field_missing_logged = false;
@@ -335,6 +349,24 @@ impl Metrics {
                     validator::seconds_to_slots(self.settings.recent_window_seconds, slot_time_ms);
                 let delinquent_slot_distance =
                     validator::delinquency_slots(self.settings.delinquency_seconds, slot_time_ms);
+
+                if let Some((epoch, _)) = epoch_info {
+                    let cached_epoch = leader_schedule_cache.as_ref().map(|(epoch, _)| *epoch);
+                    if cached_epoch != Some(epoch as u64) {
+                        match client.get_leader_schedule().await {
+                            Ok(schedule) => leader_schedule_cache = Some((epoch as u64, schedule)),
+                            Err(e) => {
+                                error!("Error fetching leader schedule: {}", e);
+                                leader_schedule_cache = None;
+                            }
+                        }
+                    }
+                }
+                let empty_schedule = LeaderSchedule::new();
+                let leader_schedule: &LeaderSchedule = leader_schedule_cache
+                    .as_ref()
+                    .map(|(_, schedule)| schedule)
+                    .unwrap_or(&empty_schedule);
 
                 // Fetch vote accounts before the reference slot. At 200 ms per slot the bank can
                 // advance during getVoteAccounts, so a slot fetched first can be older than the
@@ -381,8 +413,22 @@ impl Metrics {
                         epoch as u64,
                         &status,
                         &self.vote_account,
+                        leader_schedule,
                     );
                     self.set_reward_rate(reward_rate.as_ref());
+                    if let Some(rate) = &reward_rate {
+                        if rate.reference == RateReference::AllAccountsP10
+                            && rate_fallback_logged_epoch != Some(epoch as u64)
+                        {
+                            warn!(
+                                "Only {} accounts had no leader slot inside the reward window (minimum {}); solana_epoch_credits_rate_ratio uses the 10th percentile of all accounts for epoch {}",
+                                rate.reference_accounts,
+                                vote_accounts::MIN_REFERENCE_ACCOUNTS,
+                                epoch
+                            );
+                            rate_fallback_logged_epoch = Some(epoch as u64);
+                        }
+                    }
                 }
 
                 if let Some(epoch_info) = epoch_info {
@@ -422,13 +468,10 @@ impl Metrics {
                     }
 
                     // Send slot/epoch info to background task
-                    let leader_slots = match client.get_leader_info().await {
-                        Ok(slots) => slots,
-                        Err(e) => {
-                            error!("Error fetching leader slots: {}", e);
-                            Vec::new()
-                        }
-                    };
+                    let leader_slots: Vec<u64> = leader_schedule
+                        .get(&self.identity_account)
+                        .cloned()
+                        .unwrap_or_default();
 
                     let _ = slot_tx.send((
                         slot.unwrap_or(0),
@@ -643,6 +686,10 @@ impl Metrics {
             &self.epoch_credits_rate_percentile,
             rate.map(|r| r.percentile),
         );
+        self.set_or_remove_i64(
+            &self.rate_reference_accounts,
+            rate.map(|r| r.reference_accounts.min(i64::MAX as u64) as i64),
+        );
     }
 
     /// Export the number of our leader slots inside the reward window, or drop the sample
@@ -850,6 +897,8 @@ mod tests {
         let rate = RewardRate {
             ratio: 1.25,
             percentile: 60.0,
+            reference: RateReference::ZeroLeaderMedian,
+            reference_accounts: 512,
             first_slot: 462_000_000,
             last_slot: 462_000_500,
         };
@@ -873,6 +922,8 @@ mod tests {
         metrics.set_reward_rate(Some(&RewardRate {
             ratio: 1.25,
             percentile: 60.0,
+            reference: RateReference::AllAccountsP10,
+            reference_accounts: 12,
             first_slot: 1,
             last_slot: 2,
         }));
@@ -905,6 +956,7 @@ mod tests {
             "solana_epoch_credits_rate_ratio{",
             "solana_epoch_credits_rate_percentile{",
             "solana_leader_slots_in_window{",
+            "solana_rate_reference_accounts{",
         ] {
             assert!(!body.contains(absent), "{absent} should be absent:\n{body}");
         }
