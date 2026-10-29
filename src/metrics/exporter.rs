@@ -294,18 +294,6 @@ impl Metrics {
             let mut bls_field_missing_logged = false;
 
             loop {
-                let slot = match client.get_slot().await {
-                    Ok(s) => Some(s),
-                    Err(e) => {
-                        error!("Error fetching slot: {}", e);
-                        None
-                    }
-                };
-
-                if let Some(slot) = slot {
-                    self.set_slot(slot);
-                }
-
                 let epoch_info = match client.get_epoch().await {
                     Ok(e) => Some(e),
                     Err(e) => {
@@ -331,6 +319,20 @@ impl Metrics {
                     validator::seconds_to_slots(self.settings.recent_window_seconds, slot_time_ms);
                 let delinquent_slot_distance =
                     validator::delinquency_slots(self.settings.delinquency_seconds, slot_time_ms);
+
+                // getSlot immediately before getVoteAccounts so that the vote/root distances are
+                // measured against the same node's view of the current slot.
+                let slot = match client.get_slot().await {
+                    Ok(s) => Some(s),
+                    Err(e) => {
+                        error!("Error fetching slot: {}", e);
+                        None
+                    }
+                };
+
+                if let Some(slot) = slot {
+                    self.set_slot(slot);
+                }
 
                 // Single getVoteAccounts call per iteration; everything vote-related derives from it.
                 if let (Some(current_slot), Some((epoch, _))) = (slot, epoch_info) {
