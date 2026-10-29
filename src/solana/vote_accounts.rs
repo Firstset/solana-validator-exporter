@@ -311,10 +311,12 @@ impl RewardRateWindow {
     }
 
     /// Number of snapshots currently held.
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.snapshots.len()
     }
 
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.snapshots.is_empty()
     }
