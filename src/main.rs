@@ -5,7 +5,7 @@ use axum::Router;
 use clap::Parser;
 use env_logger::Env;
 use log::info;
-use metrics::exporter::metrics_handler;
+use metrics::exporter::{metrics_handler, CollectorSettings};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -28,12 +28,51 @@ struct Config {
     networks: BTreeMap<String, NetworkConfig>,
 }
 
+/// Wall-clock window after which a validator whose last vote is older than this
+/// is reported as delinquent. Converted to slots with the measured slot time.
+const DEFAULT_DELINQUENCY_SECONDS: u64 = 60;
+/// Sliding window over which `solana_epoch_credits_rate_ratio` is computed.
+const DEFAULT_REWARD_WINDOW_SECONDS: u64 = 900;
+/// Lookback window for fetching block rewards of recent leader slots.
+const DEFAULT_RECENT_WINDOW_SECONDS: u64 = 600;
+
+fn default_delinquency_seconds() -> u64 {
+    DEFAULT_DELINQUENCY_SECONDS
+}
+
+fn default_reward_window_seconds() -> u64 {
+    DEFAULT_REWARD_WINDOW_SECONDS
+}
+
+fn default_recent_window_seconds() -> u64 {
+    DEFAULT_RECENT_WINDOW_SECONDS
+}
+
+fn validate_reward_window_seconds(
+    network_name: &str,
+    reward_window_seconds: u64,
+) -> Result<(), String> {
+    if reward_window_seconds < solana::vote_accounts::MIN_RATE_WINDOW_SECONDS {
+        return Err(format!(
+            "network `{network_name}`: reward_window_seconds must be at least {}",
+            solana::vote_accounts::MIN_RATE_WINDOW_SECONDS
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Deserialize)]
 struct NetworkConfig {
     rpc_url: String,
     validators: Vec<NetworkValidator>,
     #[serde(default)]
     labels: BTreeMap<String, String>,
+    #[serde(default = "default_delinquency_seconds")]
+    delinquency_seconds: u64,
+    #[serde(default = "default_reward_window_seconds")]
+    reward_window_seconds: u64,
+    #[serde(default = "default_recent_window_seconds")]
+    recent_window_seconds: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -51,6 +90,7 @@ struct ValidatorConfig {
     vote_account: String,
     identity_account: String,
     labels: BTreeMap<String, String>,
+    settings: CollectorSettings,
 }
 
 #[tokio::main]
@@ -71,6 +111,9 @@ async fn main() {
     }
 
     for (network_name, network_config) in &config.networks {
+        validate_reward_window_seconds(network_name, network_config.reward_window_seconds)
+            .unwrap_or_else(|error| panic!("{error}"));
+
         for validator in &network_config.validators {
             let mut labels: BTreeMap<String, String> = network_config
                 .labels
@@ -92,6 +135,11 @@ async fn main() {
                 vote_account: validator.vote_address.clone(),
                 identity_account: validator.identity_address.clone(),
                 labels,
+                settings: CollectorSettings {
+                    delinquency_seconds: network_config.delinquency_seconds,
+                    reward_window_seconds: network_config.reward_window_seconds,
+                    recent_window_seconds: network_config.recent_window_seconds,
+                },
             });
         }
     }
@@ -119,6 +167,7 @@ async fn main() {
             vote_account,
             identity_account,
             labels,
+            settings,
         } = validator_config;
 
         info!(
@@ -131,6 +180,7 @@ async fn main() {
             identity_account,
             vote_account,
             labels,
+            settings,
         ));
 
         // Initialize metrics in shared registry
@@ -150,4 +200,57 @@ async fn main() {
         .unwrap();
 
     axum::serve(listener, router).await.unwrap();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_network_keys_are_optional_with_defaults() {
+        let yaml = r#"
+port: 9099
+networks:
+  solana_mainnet:
+    rpc_url: "https://api.mainnet-beta.solana.com"
+    validators:
+      - vote_address: "vote"
+        identity_address: "identity"
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let network = &config.networks["solana_mainnet"];
+        assert_eq!(network.delinquency_seconds, 60);
+        assert_eq!(network.reward_window_seconds, 900);
+        assert_eq!(network.recent_window_seconds, 600);
+    }
+
+    #[test]
+    fn new_network_keys_are_read() {
+        let yaml = r#"
+port: 9099
+networks:
+  solana_mainnet:
+    rpc_url: "https://api.mainnet-beta.solana.com"
+    delinquency_seconds: 45
+    reward_window_seconds: 1200
+    recent_window_seconds: 300
+    validators:
+      - vote_address: "vote"
+        identity_address: "identity"
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let network = &config.networks["solana_mainnet"];
+        assert_eq!(network.delinquency_seconds, 45);
+        assert_eq!(network.reward_window_seconds, 1200);
+        assert_eq!(network.recent_window_seconds, 300);
+    }
+
+    #[test]
+    fn reward_window_must_cover_the_minimum_rate_span() {
+        assert!(validate_reward_window_seconds("mainnet", 60).is_ok());
+        assert_eq!(
+            validate_reward_window_seconds("mainnet", 59),
+            Err("network `mainnet`: reward_window_seconds must be at least 60".to_string())
+        );
+    }
 }
