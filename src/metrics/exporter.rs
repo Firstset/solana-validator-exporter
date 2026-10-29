@@ -6,7 +6,7 @@ use axum::extract::State;
 use axum::http::header::CONTENT_TYPE;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use log::error;
+use log::{error, warn};
 use prometheus_client::encoding::text::encode;
 use prometheus_client::metrics::family::Family;
 use prometheus_client::metrics::gauge::Gauge;
@@ -59,6 +59,7 @@ pub struct Metrics {
     pub epoch_credits_percentile: Family<MetricLabels, FloatGauge>,
     pub epoch_credits_rate_ratio: Family<MetricLabels, FloatGauge>,
     pub vote_account_epoch: Family<MetricLabels, Gauge>,
+    pub bls_pubkey_registered: Family<MetricLabels, Gauge>,
 }
 
 impl Metrics {
@@ -97,6 +98,7 @@ impl Metrics {
             epoch_credits_percentile: Family::default(),
             epoch_credits_rate_ratio: Family::default(),
             vote_account_epoch: Family::default(),
+            bls_pubkey_registered: Family::default(),
         }
     }
 
@@ -224,6 +226,12 @@ impl Metrics {
             "Epoch of the newest usable epochCredits entry; lags solana_epoch when the vote account or the RPC node is stale",
             self.vote_account_epoch.clone(),
         );
+
+        state.registry.register(
+            "solana_bls_pubkey_registered",
+            "1 if the vote account state contains a BLS pubkey (required for admission to the Alpenglow validator set), else 0; polled once per epoch",
+            self.bls_pubkey_registered.clone(),
+        );
     }
 
     pub fn run_loop(self: Arc<Self>) -> tokio::task::JoinHandle<()> {
@@ -281,6 +289,9 @@ impl Metrics {
             });
 
             let mut reward_window = RewardRateWindow::new(self.settings.reward_window_seconds);
+            // BLS registration is checked once per epoch; a missing field is logged once.
+            let mut bls_checked_epoch: Option<u64> = None;
+            let mut bls_field_missing_logged = false;
 
             loop {
                 let slot = match client.get_slot().await {
@@ -346,6 +357,25 @@ impl Metrics {
                     let (epoch, epoch_progress) = epoch_info;
                     self.set_epoch(epoch);
                     self.set_epoch_progress(epoch_progress);
+
+                    if bls_checked_epoch != Some(epoch as u64) {
+                        match client.get_bls_pubkey_registered().await {
+                            Ok(registered) => {
+                                if registered.is_none() && !bls_field_missing_logged {
+                                    warn!(
+                                        "RPC node does not report blsPubkeyCompressed for {}; exporting solana_bls_pubkey_registered=0",
+                                        self.vote_account
+                                    );
+                                    bls_field_missing_logged = true;
+                                }
+                                self.set_bls_pubkey_registered(registered.unwrap_or(false));
+                                bls_checked_epoch = Some(epoch as u64);
+                            }
+                            Err(e) => {
+                                error!("Error fetching vote account state for BLS pubkey: {}", e);
+                            }
+                        }
+                    }
 
                     let jito_tips = match client.get_jito_tips(epoch).await {
                         Ok(tips) => Some(tips),
@@ -600,6 +630,13 @@ impl Metrics {
                 family.remove(&labels);
             }
         }
+    }
+
+    pub fn set_bls_pubkey_registered(&self, registered: bool) {
+        let labels = self.base_label_pairs();
+        self.bls_pubkey_registered
+            .get_or_create(&labels)
+            .set(registered as i64);
     }
 
     pub fn set_slot_time_ms(&self, slot_time_ms: u64) {

@@ -8,6 +8,7 @@ use solana_rpc_client_api::config::{
     RpcAccountInfoConfig, RpcBlockConfig, RpcGetVoteAccountsConfig, RpcProgramAccountsConfig,
 };
 use solana_rpc_client_api::filter::{Memcmp, RpcFilterType};
+use solana_rpc_client_api::request::RpcRequest;
 use solana_rpc_client_api::response::{RpcPerfSample, RpcVoteAccountStatus};
 use solana_sdk::account_utils::StateMut;
 use solana_sdk::pubkey::Pubkey;
@@ -90,6 +91,19 @@ pub fn ms_to_next_slot(current_slot: u64, leader_slots: &[u64], slot_time_ms: u6
         Some(next_slot) => ((next_slot - current_slot).saturating_mul(slot_time_ms)) as i64,
         None => -1,
     }
+}
+
+/// Whether a vote account registered a BLS pubkey, read from a `getAccountInfo` (jsonParsed)
+/// result. Returns `None` when the parsed vote state has no `blsPubkeyCompressed` field at all
+/// (RPC node older than agave 4.3), `Some(false)` when it is null, `Some(true)` otherwise.
+pub fn bls_pubkey_registered(account_info_result: &serde_json::Value) -> Option<bool> {
+    let info = account_info_result
+        .get("value")?
+        .get("data")?
+        .get("parsed")?
+        .get("info")?;
+    let bls = info.as_object()?.get("blsPubkeyCompressed")?;
+    Some(!bls.is_null())
 }
 
 pub struct SolanaClient {
@@ -498,6 +512,31 @@ impl SolanaClient {
         Ok(sum / 4)
     }
 
+    /// `getAccountInfo` with `jsonParsed` on the vote account to check whether a BLS pubkey is
+    /// registered (required for admission to the Alpenglow validator set). `Ok(None)` means the
+    /// RPC node does not report the field. Meant to be polled once per epoch.
+    pub async fn get_bls_pubkey_registered(
+        &self,
+    ) -> Result<Option<bool>, Box<dyn std::error::Error + Send + Sync>> {
+        let result: serde_json::Value = self
+            .client
+            .send(
+                RpcRequest::GetAccountInfo,
+                serde_json::json!([
+                    self.vote_account,
+                    RpcAccountInfoConfig {
+                        encoding: Some(solana_account_decoder::UiAccountEncoding::JsonParsed),
+                        ..RpcAccountInfoConfig::default()
+                    }
+                ]),
+            )
+            .await?;
+        if result.get("value").map_or(true, |v| v.is_null()) {
+            return Err(format!("vote account {} not found", self.vote_account).into());
+        }
+        Ok(bls_pubkey_registered(&result))
+    }
+
     /// One `getVoteAccounts` call per loop iteration, keeping unstaked delinquents so that
     /// voting status, vote/root distances, credits and cluster statistics all come from the
     /// same response. `delinquent_slot_distance` is derived from `delinquency_seconds`.
@@ -563,6 +602,32 @@ mod tests {
         assert_eq!(seconds_to_slots(600, 200), 3000);
         // A zero slot time never divides by zero
         assert_eq!(seconds_to_slots(60, 0), 300);
+    }
+
+    #[test]
+    fn bls_pubkey_is_read_from_parsed_vote_state() {
+        let registered = serde_json::json!({
+            "context": {"slot": 1},
+            "value": {"data": {"parsed": {"info": {
+                "nodePubkey": "x",
+                "blsPubkeyCompressed": "8f3ab2"
+            }, "type": "vote"}, "program": "vote"}}
+        });
+        assert_eq!(bls_pubkey_registered(&registered), Some(true));
+
+        let unregistered = serde_json::json!({
+            "value": {"data": {"parsed": {"info": {"blsPubkeyCompressed": null}}}}
+        });
+        assert_eq!(bls_pubkey_registered(&unregistered), Some(false));
+
+        let old_rpc = serde_json::json!({
+            "value": {"data": {"parsed": {"info": {"nodePubkey": "x"}}}}
+        });
+        assert_eq!(bls_pubkey_registered(&old_rpc), None);
+
+        // Base64-encoded (unparsed) data never panics.
+        let unparsed = serde_json::json!({"value": {"data": ["AAAA", "base64"]}});
+        assert_eq!(bls_pubkey_registered(&unparsed), None);
     }
 
     #[test]
