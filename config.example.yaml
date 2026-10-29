@@ -8,7 +8,7 @@ networks:
     # slots at runtime with the slot time measured from the RPC node
     # (solana_slot_time_ms), so they keep their meaning when slot times change.
     delinquency_seconds: 60        # last vote older than this => delinquent (floor: 32 slots)
-    reward_window_seconds: 900     # sliding window for solana_epoch_credits_rate_ratio (minimum 60)
+    reward_window_seconds: 900     # sliding window for solana_epoch_credits_rate_ratio / _rate_percentile / solana_leader_slots_in_window (minimum 60)
     recent_window_seconds: 600     # lookback for fetching block rewards of leader slots
     validators:
       - vote_address: "YOUR_MAINNET_VOTE_ACCOUNT_PUBKEY"

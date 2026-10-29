@@ -67,9 +67,15 @@ solana_epoch_credits_per_stake_ratio{network="solana_mainnet",stage="mainnet",vo
 # HELP solana_epoch_credits_percentile Percentage (0-100) of staked vote accounts whose epoch-to-date credits per stake is strictly below ours; accounts without a current-epoch entry count as 0.
 # TYPE solana_epoch_credits_percentile gauge
 solana_epoch_credits_percentile{network="solana_mainnet",stage="mainnet",vote_account="Ours11111111111111111111111111111111111111111"} 40.0
-# HELP solana_epoch_credits_rate_ratio Credits per stake earned over the last reward_window_seconds divided by the cluster median's increase over the same window (1.0 = median); absent until the window holds two snapshots at least 60 s apart.
+# HELP solana_epoch_credits_rate_ratio Credits per stake earned over the last reward_window_seconds divided by the cluster median of the same per-account quantity (1.0 = median); our own leader slots inflate it for one window; absent until the window holds two snapshots at least 60 s apart.
 # TYPE solana_epoch_credits_rate_ratio gauge
 solana_epoch_credits_rate_ratio{network="solana_mainnet",stage="mainnet",vote_account="Ours11111111111111111111111111111111111111111"} 1.25
+# HELP solana_epoch_credits_rate_percentile Percentage (0-100) of staked vote accounts whose credits per stake earned over the last reward_window_seconds is strictly below ours, among accounts that earned anything in the window; informational only: healthy validators cluster at the same rate, so values between ~10 and ~60 are noise.
+# TYPE solana_epoch_credits_rate_percentile gauge
+solana_epoch_credits_rate_percentile{network="solana_mainnet",stage="mainnet",vote_account="Ours11111111111111111111111111111111111111111"} 60.0
+# HELP solana_leader_slots_in_window Number of our scheduled leader slots inside the reward_window_seconds window; leader rewards make solana_epoch_credits_rate_ratio spike above 1 when this is non-zero.
+# TYPE solana_leader_slots_in_window gauge
+solana_leader_slots_in_window{network="solana_mainnet",stage="mainnet",vote_account="Ours11111111111111111111111111111111111111111"} 2
 # HELP solana_vote_account_epoch Epoch of the newest usable epochCredits entry; lags solana_epoch when the vote account or the RPC node is stale.
 # TYPE solana_vote_account_epoch gauge
 solana_vote_account_epoch{network="solana_mainnet",stage="mainnet",vote_account="Ours11111111111111111111111111111111111111111"} 1070
