@@ -46,7 +46,7 @@ This is a Prometheus exporter for Solana validators that supports monitoring mul
     - `validators`: A list of validator objects with `vote_address` and `identity_address` keys.
     - `labels` _(optional)_: Additional key/value pairs that will be attached to every metric for that network.
     - `delinquency_seconds` _(optional, default `60`)_: A validator whose last vote is older than this is reported as delinquent (`solana_voting_status` = 0). It is converted to slots every loop iteration with the measured slot time (`max(32, round(seconds * 1000 / slot_time_ms))`), so it is 300 slots at 200 ms slots and 150 slots at 400 ms slots.
-    - `reward_window_seconds` _(optional, default `900`)_: Sliding window over which `solana_epoch_credits_rate_ratio` is computed.
+    - `reward_window_seconds` _(optional, default `900`, minimum `60`)_: Sliding window over which `solana_epoch_credits_rate_ratio` is computed.
     - `recent_window_seconds` _(optional, default `600`)_: How far back (in wall-clock time) leader slots are fetched for `solana_epoch_block_rewards`.
 
     The exporter automatically adds `network` and `vote_account` labels. If you supply a `network` entry inside `labels`, it overrides the default value derived from the config key. Note that you can also set labels for each validator, which overrides the values configured at the network level.

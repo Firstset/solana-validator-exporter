@@ -48,6 +48,19 @@ fn default_recent_window_seconds() -> u64 {
     DEFAULT_RECENT_WINDOW_SECONDS
 }
 
+fn validate_reward_window_seconds(
+    network_name: &str,
+    reward_window_seconds: u64,
+) -> Result<(), String> {
+    if reward_window_seconds < solana::vote_accounts::MIN_RATE_WINDOW_SECONDS {
+        return Err(format!(
+            "network `{network_name}`: reward_window_seconds must be at least {}",
+            solana::vote_accounts::MIN_RATE_WINDOW_SECONDS
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Deserialize)]
 struct NetworkConfig {
     rpc_url: String,
@@ -98,6 +111,9 @@ async fn main() {
     }
 
     for (network_name, network_config) in &config.networks {
+        validate_reward_window_seconds(network_name, network_config.reward_window_seconds)
+            .unwrap_or_else(|error| panic!("{error}"));
+
         for validator in &network_config.validators {
             let mut labels: BTreeMap<String, String> = network_config
                 .labels
@@ -227,5 +243,14 @@ networks:
         assert_eq!(network.delinquency_seconds, 45);
         assert_eq!(network.reward_window_seconds, 1200);
         assert_eq!(network.recent_window_seconds, 300);
+    }
+
+    #[test]
+    fn reward_window_must_cover_the_minimum_rate_span() {
+        assert!(validate_reward_window_seconds("mainnet", 60).is_ok());
+        assert_eq!(
+            validate_reward_window_seconds("mainnet", 59),
+            Err("network `mainnet`: reward_window_seconds must be at least 60".to_string())
+        );
     }
 }
