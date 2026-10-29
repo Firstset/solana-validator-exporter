@@ -1,6 +1,6 @@
 use crate::solana;
 use crate::solana::validator::{self, StakeState};
-use crate::solana::vote_accounts::{self, RewardRateWindow, VoteAccountAnalysis};
+use crate::solana::vote_accounts::{self, RewardRate, RewardRateWindow, VoteAccountAnalysis};
 use axum::body::Body;
 use axum::extract::State;
 use axum::http::header::CONTENT_TYPE;
@@ -58,6 +58,8 @@ pub struct Metrics {
     pub epoch_credits_per_stake_ratio: Family<MetricLabels, FloatGauge>,
     pub epoch_credits_percentile: Family<MetricLabels, FloatGauge>,
     pub epoch_credits_rate_ratio: Family<MetricLabels, FloatGauge>,
+    pub epoch_credits_rate_percentile: Family<MetricLabels, FloatGauge>,
+    pub leader_slots_in_window: Family<MetricLabels, Gauge>,
     pub vote_account_epoch: Family<MetricLabels, Gauge>,
     pub bls_pubkey_registered: Family<MetricLabels, Gauge>,
 }
@@ -97,6 +99,8 @@ impl Metrics {
             epoch_credits_per_stake_ratio: Family::default(),
             epoch_credits_percentile: Family::default(),
             epoch_credits_rate_ratio: Family::default(),
+            epoch_credits_rate_percentile: Family::default(),
+            leader_slots_in_window: Family::default(),
             vote_account_epoch: Family::default(),
             bls_pubkey_registered: Family::default(),
         }
@@ -217,8 +221,20 @@ impl Metrics {
 
         state.registry.register(
             "solana_epoch_credits_rate_ratio",
-            "Credits per stake earned over the last reward_window_seconds divided by the cluster median's increase over the same window (1.0 = median); absent until the window holds two snapshots at least 60 s apart",
+            "Credits per stake earned over the last reward_window_seconds divided by the cluster median of the same per-account quantity (1.0 = median); our own leader slots inflate it for one window; absent until the window holds two snapshots at least 60 s apart",
             self.epoch_credits_rate_ratio.clone(),
+        );
+
+        state.registry.register(
+            "solana_epoch_credits_rate_percentile",
+            "Percentage (0-100) of staked vote accounts whose credits per stake earned over the last reward_window_seconds is strictly below ours, among accounts that earned anything in the window; informational only: healthy validators cluster at the same rate, so values between ~10 and ~60 are noise",
+            self.epoch_credits_rate_percentile.clone(),
+        );
+
+        state.registry.register(
+            "solana_leader_slots_in_window",
+            "Number of our scheduled leader slots inside the reward_window_seconds window; leader rewards make solana_epoch_credits_rate_ratio spike above 1 when this is non-zero",
+            self.leader_slots_in_window.clone(),
         );
 
         state.registry.register(
@@ -348,6 +364,7 @@ impl Metrics {
                 }
 
                 // Everything vote-related derives from the single snapshot fetched above.
+                let mut reward_rate: Option<RewardRate> = None;
                 if let (Some(status), Some(current_slot), Some((epoch, _))) =
                     (vote_accounts, slot, epoch_info)
                 {
@@ -358,8 +375,14 @@ impl Metrics {
                         current_slot,
                     );
                     self.set_vote_account_analysis(&analysis);
-                    let rate_ratio = reward_window.push(unix_time_secs(), epoch as u64, &analysis);
-                    self.set_or_remove_f64(&self.epoch_credits_rate_ratio, rate_ratio);
+                    reward_rate = reward_window.push(
+                        unix_time_secs(),
+                        current_slot,
+                        epoch as u64,
+                        &status,
+                        &self.vote_account,
+                    );
+                    self.set_reward_rate(reward_rate.as_ref());
                 }
 
                 if let Some(epoch_info) = epoch_info {
@@ -416,6 +439,11 @@ impl Metrics {
 
                     // Update solana_blocks{block_type="scheduled"}
                     self.set_block_scheduled(leader_slots.len() as u64);
+                    self.set_leader_slots_in_window(
+                        reward_rate
+                            .as_ref()
+                            .map(|rate| rate.leader_slots_in_window(&leader_slots)),
+                    );
 
                     self.set_ms_to_next_slot(validator::ms_to_next_slot(
                         slot.unwrap_or(0),
@@ -606,6 +634,24 @@ impl Metrics {
             analysis.credits_per_stake_ratio,
         );
         self.set_or_remove_f64(&self.epoch_credits_percentile, analysis.credits_percentile);
+    }
+
+    /// Export the windowed reward rate, or drop both samples while the window is not ready.
+    pub fn set_reward_rate(&self, rate: Option<&RewardRate>) {
+        self.set_or_remove_f64(&self.epoch_credits_rate_ratio, rate.map(|r| r.ratio));
+        self.set_or_remove_f64(
+            &self.epoch_credits_rate_percentile,
+            rate.map(|r| r.percentile),
+        );
+    }
+
+    /// Export the number of our leader slots inside the reward window, or drop the sample
+    /// while the window is not ready.
+    pub fn set_leader_slots_in_window(&self, count: Option<u64>) {
+        self.set_or_remove_i64(
+            &self.leader_slots_in_window,
+            count.map(|c| c.min(i64::MAX as u64) as i64),
+        );
     }
 
     pub fn set_epoch_credits(&self, credits: u64) {
@@ -801,7 +847,19 @@ mod tests {
             credits_percentile: Some(40.0),
             vote_credit_rank: 2,
         });
-        metrics.set_or_remove_f64(&metrics.epoch_credits_rate_ratio, Some(1.25));
+        let rate = RewardRate {
+            ratio: 1.25,
+            percentile: 60.0,
+            first_slot: 462_000_000,
+            last_slot: 462_000_500,
+        };
+        metrics.set_reward_rate(Some(&rate));
+        metrics.set_leader_slots_in_window(Some(rate.leader_slots_in_window(&[
+            461_999_999,
+            462_000_000,
+            462_000_004,
+            462_000_500,
+        ])));
 
         let body = normalize(&render(&metrics).await);
         let expected = normalize(include_str!("fixtures/metrics_snapshot.txt"));
@@ -812,7 +870,13 @@ mod tests {
     #[tokio::test]
     async fn optional_metrics_are_removed_when_unavailable() {
         let metrics = fixture_metrics();
-        metrics.set_or_remove_f64(&metrics.epoch_credits_rate_ratio, Some(1.25));
+        metrics.set_reward_rate(Some(&RewardRate {
+            ratio: 1.25,
+            percentile: 60.0,
+            first_slot: 1,
+            last_slot: 2,
+        }));
+        metrics.set_leader_slots_in_window(Some(2));
         metrics.set_vote_account_analysis(&VoteAccountAnalysis {
             voting_status: -1,
             vote_distance_slots: None,
@@ -826,7 +890,8 @@ mod tests {
             credits_percentile: None,
             vote_credit_rank: 0,
         });
-        metrics.set_or_remove_f64(&metrics.epoch_credits_rate_ratio, None);
+        metrics.set_reward_rate(None);
+        metrics.set_leader_slots_in_window(None);
 
         let body = render(&metrics).await;
         assert!(body.contains("solana_voting_status{"), "{body}");
@@ -838,6 +903,8 @@ mod tests {
             "solana_epoch_credits_per_stake_ratio{",
             "solana_epoch_credits_percentile{",
             "solana_epoch_credits_rate_ratio{",
+            "solana_epoch_credits_rate_percentile{",
+            "solana_leader_slots_in_window{",
         ] {
             assert!(!body.contains(absent), "{absent} should be absent:\n{body}");
         }
