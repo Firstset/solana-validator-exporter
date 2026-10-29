@@ -1,6 +1,6 @@
 use crate::solana;
 use crate::solana::validator::{self, StakeState};
-use crate::solana::vote_accounts::{self, VoteAccountAnalysis};
+use crate::solana::vote_accounts::{self, RewardRateWindow, VoteAccountAnalysis};
 use axum::body::Body;
 use axum::extract::State;
 use axum::http::header::CONTENT_TYPE;
@@ -57,6 +57,7 @@ pub struct Metrics {
     pub epoch_credits: Family<MetricLabels, Gauge>,
     pub epoch_credits_per_stake_ratio: Family<MetricLabels, FloatGauge>,
     pub epoch_credits_percentile: Family<MetricLabels, FloatGauge>,
+    pub epoch_credits_rate_ratio: Family<MetricLabels, FloatGauge>,
     pub vote_account_epoch: Family<MetricLabels, Gauge>,
 }
 
@@ -94,6 +95,7 @@ impl Metrics {
             epoch_credits: Family::default(),
             epoch_credits_per_stake_ratio: Family::default(),
             epoch_credits_percentile: Family::default(),
+            epoch_credits_rate_ratio: Family::default(),
             vote_account_epoch: Family::default(),
         }
     }
@@ -212,6 +214,12 @@ impl Metrics {
         );
 
         state.registry.register(
+            "solana_epoch_credits_rate_ratio",
+            "Credits per stake earned over the last reward_window_seconds divided by the cluster median's increase over the same window (1.0 = median); absent until the window holds two snapshots at least 60 s apart",
+            self.epoch_credits_rate_ratio.clone(),
+        );
+
+        state.registry.register(
             "solana_vote_account_epoch",
             "Epoch of the newest usable epochCredits entry; lags solana_epoch when the vote account or the RPC node is stale",
             self.vote_account_epoch.clone(),
@@ -272,6 +280,8 @@ impl Metrics {
                 }
             });
 
+            let mut reward_window = RewardRateWindow::new(self.settings.reward_window_seconds);
+
             loop {
                 let slot = match client.get_slot().await {
                     Ok(s) => Some(s),
@@ -322,6 +332,9 @@ impl Metrics {
                                 current_slot,
                             );
                             self.set_vote_account_analysis(&analysis);
+                            let rate_ratio =
+                                reward_window.push(unix_time_secs(), epoch as u64, &analysis);
+                            self.set_or_remove_f64(&self.epoch_credits_rate_ratio, rate_ratio);
                         }
                         Err(e) => {
                             error!("Error fetching vote accounts: {}", e);
@@ -618,6 +631,13 @@ impl Metrics {
         labels.push((key.to_string(), value.into()));
         labels
     }
+}
+
+fn unix_time_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 pub struct AppState {

@@ -12,6 +12,7 @@
 //!   statistics are computed on credits per lamport of stake.
 
 use solana_rpc_client_api::response::{RpcVoteAccountInfo, RpcVoteAccountStatus};
+use std::collections::VecDeque;
 
 /// Marker epoch written into `epochCredits` by the Alpenglow vote-state migration.
 pub const MIGRATION_MARKER_EPOCH: u64 = u64::MAX;
@@ -215,6 +216,108 @@ pub fn vote_credit_rank(
         }
     }
     0
+}
+
+/// Minimum span the sliding window must cover before a rate ratio is reported.
+pub const MIN_RATE_WINDOW_SECONDS: u64 = 60;
+
+#[derive(Debug, Clone, PartialEq)]
+struct RateSnapshot {
+    timestamp_secs: u64,
+    epoch: u64,
+    our_credits: u64,
+    cluster_median_credits_per_stake: f64,
+}
+
+/// Sliding window of `(timestamp, our_credits, cluster_median_credits_per_stake)` snapshots
+/// used for `solana_epoch_credits_rate_ratio`: our credit increase per stake over the window,
+/// divided by the increase of the cluster median over the same window.
+///
+/// The epoch-to-date ratio dilutes a problem that starts mid-epoch; this one does not.
+#[derive(Debug)]
+pub struct RewardRateWindow {
+    window_seconds: u64,
+    snapshots: VecDeque<RateSnapshot>,
+}
+
+impl RewardRateWindow {
+    pub fn new(window_seconds: u64) -> Self {
+        Self {
+            window_seconds,
+            snapshots: VecDeque::new(),
+        }
+    }
+
+    /// Record a snapshot taken at `timestamp_secs` and return the rate ratio, or `None` while
+    /// the window holds fewer than two snapshots, spans less than
+    /// [`MIN_RATE_WINDOW_SECONDS`], or the cluster median did not increase.
+    pub fn push(
+        &mut self,
+        timestamp_secs: u64,
+        epoch: u64,
+        analysis: &VoteAccountAnalysis,
+    ) -> Option<f64> {
+        // Without stake or a cluster median there is nothing to compare against.
+        let median = analysis.cluster_median_credits_per_stake?;
+        if analysis.activated_stake == 0 || analysis.voting_status == VOTING_STATUS_NOT_FOUND {
+            return None;
+        }
+
+        // Credits reset at the epoch boundary: snapshots from another epoch are useless.
+        if self
+            .snapshots
+            .back()
+            .is_some_and(|last| last.epoch != epoch)
+        {
+            self.snapshots.clear();
+        }
+        // Timestamps that move backwards would corrupt the deltas; start over.
+        if self
+            .snapshots
+            .back()
+            .is_some_and(|last| last.timestamp_secs > timestamp_secs)
+        {
+            self.snapshots.clear();
+        }
+
+        self.snapshots.push_back(RateSnapshot {
+            timestamp_secs,
+            epoch,
+            our_credits: analysis.epoch_credits,
+            cluster_median_credits_per_stake: median,
+        });
+        while self
+            .snapshots
+            .front()
+            .is_some_and(|first| timestamp_secs - first.timestamp_secs > self.window_seconds)
+        {
+            self.snapshots.pop_front();
+        }
+
+        let (first, last) = (self.snapshots.front()?, self.snapshots.back()?);
+        if self.snapshots.len() < 2
+            || last.timestamp_secs - first.timestamp_secs < MIN_RATE_WINDOW_SECONDS
+        {
+            return None;
+        }
+        let our_delta = last.our_credits.saturating_sub(first.our_credits) as f64
+            / analysis.activated_stake as f64;
+        let median_delta =
+            last.cluster_median_credits_per_stake - first.cluster_median_credits_per_stake;
+        if median_delta <= 0.0 {
+            return None;
+        }
+        Some(our_delta / median_delta)
+    }
+
+    /// Number of snapshots currently held.
+    pub fn len(&self) -> usize {
+        self.snapshots.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.snapshots.is_empty()
+    }
 }
 
 #[cfg(test)]
@@ -461,5 +564,95 @@ mod tests {
         assert_eq!(percentile(1.0, &[1.0]), Some(0.0));
         assert_eq!(percentile(2.0, &[1.0, 2.0, 3.0, 4.0]), Some(25.0));
         assert_eq!(percentile(5.0, &[1.0, 2.0, 3.0, 4.0]), Some(100.0));
+    }
+
+    fn staked_analysis(epoch_credits: u64, median: f64) -> VoteAccountAnalysis {
+        VoteAccountAnalysis {
+            voting_status: VOTING_STATUS_CURRENT,
+            vote_distance_slots: Some(2),
+            root_distance_slots: Some(34),
+            epoch_credits,
+            vote_account_epoch: Some(EPOCH),
+            activated_stake: 100_000,
+            credits_per_stake: Some(epoch_credits as f64 / 100_000.0),
+            cluster_median_credits_per_stake: Some(median),
+            credits_per_stake_ratio: None,
+            credits_percentile: None,
+            vote_credit_rank: 0,
+        }
+    }
+
+    #[test]
+    fn rate_ratio_needs_two_snapshots_15_minutes_apart() {
+        let mut window = RewardRateWindow::new(900);
+        // Single snapshot: no sample.
+        assert_eq!(
+            window.push(1_000, EPOCH, &staked_analysis(1_000, 0.0100)),
+            None
+        );
+        assert_eq!(window.len(), 1);
+        // 15 min later: we earned 500 more credits on 100_000 stake => 0.005 per stake;
+        // the cluster median rose from 0.0100 to 0.0140 => 0.004 per stake. Ratio = 1.25.
+        let ratio = window.push(1_900, EPOCH, &staked_analysis(1_500, 0.0140));
+        assert_close(ratio, 1.25);
+        assert_eq!(window.len(), 2);
+    }
+
+    #[test]
+    fn rate_ratio_waits_for_the_minimum_span() {
+        let mut window = RewardRateWindow::new(900);
+        assert_eq!(
+            window.push(1_000, EPOCH, &staked_analysis(1_000, 0.0100)),
+            None
+        );
+        // 30 s later: two snapshots but under the 60 s minimum.
+        assert_eq!(
+            window.push(1_030, EPOCH, &staked_analysis(1_100, 0.0105)),
+            None
+        );
+        // 60 s after the first snapshot: reported, over the whole window.
+        let ratio = window.push(1_060, EPOCH, &staked_analysis(1_200, 0.0110));
+        // Ours: 200 / 100_000 = 0.002; median: 0.001 => 2.0
+        assert_close(ratio, 2.0);
+    }
+
+    #[test]
+    fn rate_ratio_slides_and_resets_on_epoch_change() {
+        let mut window = RewardRateWindow::new(900);
+        window.push(0, EPOCH, &staked_analysis(0, 0.0));
+        window.push(600, EPOCH, &staked_analysis(600, 0.006));
+        window.push(1_200, EPOCH, &staked_analysis(1_200, 0.012));
+        // The snapshot at t=0 is older than 900 s and has been dropped.
+        assert_eq!(window.len(), 2);
+        // At t=1800 the t=600 snapshot slides out as well; the window is [1200, 1800].
+        let ratio = window.push(1_800, EPOCH, &staked_analysis(1_500, 0.018));
+        assert_eq!(window.len(), 2);
+        // Since t=1200: ours 300 / 100_000 = 0.003; median 0.006 => 0.5
+        assert_close(ratio, 0.5);
+
+        // New epoch: history is discarded and no sample is reported.
+        assert_eq!(
+            window.push(2_400, EPOCH + 1, &staked_analysis(10, 0.0001)),
+            None
+        );
+        assert_eq!(window.len(), 1);
+    }
+
+    #[test]
+    fn rate_ratio_is_omitted_without_stake_or_median() {
+        let mut window = RewardRateWindow::new(900);
+        let mut unstaked = staked_analysis(1_000, 0.01);
+        unstaked.activated_stake = 0;
+        assert_eq!(window.push(0, EPOCH, &unstaked), None);
+        assert!(window.is_empty());
+
+        let mut no_median = staked_analysis(1_000, 0.01);
+        no_median.cluster_median_credits_per_stake = None;
+        assert_eq!(window.push(0, EPOCH, &no_median), None);
+        assert!(window.is_empty());
+
+        // Flat cluster median: no ratio rather than a division by zero.
+        window.push(0, EPOCH, &staked_analysis(0, 0.01));
+        assert_eq!(window.push(900, EPOCH, &staked_analysis(100, 0.01)), None);
     }
 }
