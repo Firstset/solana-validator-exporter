@@ -49,8 +49,6 @@ This is a Prometheus exporter for Solana validators that supports monitoring mul
     - `reward_window_seconds` _(optional, default `900`)_: Sliding window over which `solana_epoch_credits_rate_ratio` is computed.
     - `recent_window_seconds` _(optional, default `600`)_: How far back (in wall-clock time) leader slots are fetched for `solana_epoch_block_rewards`.
 
-    Unknown keys are rejected, so a typo in a key name fails at startup instead of being silently ignored.
-
     The exporter automatically adds `network` and `vote_account` labels. If you supply a `network` entry inside `labels`, it overrides the default value derived from the config key. Note that you can also set labels for each validator, which overrides the values configured at the network level.
 
 ## Running the Exporter

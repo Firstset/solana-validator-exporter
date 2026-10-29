@@ -23,7 +23,6 @@ struct CliArgs {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct Config {
     port: u16,
     networks: BTreeMap<String, NetworkConfig>,
@@ -50,7 +49,6 @@ fn default_recent_window_seconds() -> u64 {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct NetworkConfig {
     rpc_url: String,
     validators: Vec<NetworkValidator>,
@@ -65,7 +63,6 @@ struct NetworkConfig {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct NetworkValidator {
     vote_address: String,
     identity_address: String,
@@ -230,20 +227,5 @@ networks:
         assert_eq!(network.delinquency_seconds, 45);
         assert_eq!(network.reward_window_seconds, 1200);
         assert_eq!(network.recent_window_seconds, 300);
-    }
-
-    #[test]
-    fn unknown_keys_fail_deserialization() {
-        let yaml = r#"
-port: 9099
-networks:
-  solana_mainnet:
-    rpc_url: "https://api.mainnet-beta.solana.com"
-    delinquency_slots: 125
-    validators:
-      - vote_address: "vote"
-        identity_address: "identity"
-"#;
-        assert!(serde_yaml::from_str::<Config>(yaml).is_err());
     }
 }
