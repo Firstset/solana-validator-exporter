@@ -16,11 +16,24 @@ use tokio::sync::Mutex;
 
 type MetricLabels = Vec<(String, String)>;
 
+/// Per-network collection settings, all expressed in wall-clock seconds and
+/// converted to slots at runtime with the measured slot time.
+#[derive(Debug, Clone, Copy)]
+pub struct CollectorSettings {
+    /// A validator whose last vote is older than this is reported as delinquent.
+    pub delinquency_seconds: u64,
+    /// Sliding window for `solana_epoch_credits_rate_ratio`.
+    pub reward_window_seconds: u64,
+    /// Lookback window for fetching block rewards of recent leader slots.
+    pub recent_window_seconds: u64,
+}
+
 pub struct Metrics {
     rpc_url: String,
     identity_account: String,
     vote_account: String,
     static_labels: Arc<BTreeMap<String, String>>,
+    settings: CollectorSettings,
     pub slot: Family<MetricLabels, Gauge>,
     pub epoch: Family<MetricLabels, Gauge>,
     pub epoch_progress: Family<MetricLabels, Gauge>,
@@ -43,12 +56,14 @@ impl Metrics {
         identity_account: String,
         vote_account: String,
         labels: BTreeMap<String, String>,
+        settings: CollectorSettings,
     ) -> Metrics {
         Metrics {
             rpc_url,
             identity_account,
             vote_account,
             static_labels: Arc::new(labels),
+            settings,
             slot: Family::default(),
             epoch: Family::default(),
             epoch_progress: Family::default(),
