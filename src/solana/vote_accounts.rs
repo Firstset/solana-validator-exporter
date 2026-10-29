@@ -229,8 +229,19 @@ pub fn vote_credit_rank(
 /// Minimum span the sliding window must cover before a rate ratio is reported.
 pub const MIN_RATE_WINDOW_SECONDS: u64 = 60;
 
-/// `(activatedStake, current_epoch_credits)` of one staked account in a snapshot.
-type StakeAndCredits = (u64, u64);
+/// Minimum size of the zero-leader reference population before the p10-of-all fallback engages.
+pub const MIN_REFERENCE_ACCOUNTS: usize = 50;
+
+/// Leader schedule of the current epoch: identity pubkey => absolute leader slots.
+pub type LeaderSchedule = HashMap<String, Vec<u64>>;
+
+#[derive(Debug, Clone, PartialEq)]
+struct AccountSnapshot {
+    stake: u64,
+    credits: u64,
+    /// `nodePubkey`, used to look the account up in the leader schedule.
+    identity: String,
+}
 
 #[derive(Debug, Clone, PartialEq)]
 struct RateSnapshot {
@@ -240,17 +251,50 @@ struct RateSnapshot {
     /// Every account with `activatedStake > 0`, keyed by vote pubkey. Accounts without a
     /// current-epoch entry are stored with 0 credits; their delta is never positive, so they
     /// drop out of the cluster statistics on their own.
-    accounts: HashMap<String, StakeAndCredits>,
+    accounts: HashMap<String, AccountSnapshot>,
+}
+
+/// Number of `leader_slots` inside `(first_slot, last_slot]`: the range whose votes and
+/// leader rewards a credit delta between snapshots at those slots covers.
+fn leader_slots_between(leader_slots: &[u64], first_slot: u64, last_slot: u64) -> u64 {
+    leader_slots
+        .iter()
+        .filter(|slot| **slot > first_slot && **slot <= last_slot)
+        .count() as u64
+}
+
+/// Value at nearest-rank percentile `pct` (0-100) of a slice (any order); `None` when empty.
+pub fn percentile_value(values: &mut [f64], pct: usize) -> Option<f64> {
+    if values.is_empty() {
+        return None;
+    }
+    let rank = (values.len() * pct).div_ceil(100).max(1);
+    let (_, value, _) = values.select_nth_unstable_by(rank - 1, |a, b| a.total_cmp(b));
+    Some(*value)
+}
+
+/// Which cluster statistic the rate ratio was divided by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RateReference {
+    /// Median windowed credits per stake of accounts with no leader slot inside the window.
+    ZeroLeaderMedian,
+    /// 10th percentile over all accounts: fallback when fewer than
+    /// [`MIN_REFERENCE_ACCOUNTS`] accounts had no leader slot inside the window.
+    AllAccountsP10,
 }
 
 /// Windowed reward rate of our vote account relative to the cluster.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RewardRate {
-    /// Our windowed credits per stake divided by the cluster median of the per-account
-    /// windowed credits per stake (1.0 = median).
+    /// Our windowed credits per stake divided by the cluster reference (1.0 = reference).
     pub ratio: f64,
-    /// Percentile (0-100) of our windowed credits per stake among the accounts in the median.
+    /// Percentile (0-100) of our windowed credits per stake among all accounts that earned
+    /// anything in the window. Informational only.
     pub percentile: f64,
+    /// Statistic used as the denominator of `ratio`.
+    pub reference: RateReference,
+    /// Number of accounts with a positive delta and no leader slot inside the window.
+    pub reference_accounts: u64,
     /// Slot of the oldest snapshot in the window.
     pub first_slot: u64,
     /// Slot of the newest snapshot in the window.
@@ -258,13 +302,9 @@ pub struct RewardRate {
 }
 
 impl RewardRate {
-    /// Number of `leader_slots` inside the window: slots in `(first_slot, last_slot]`, the
-    /// range whose votes and leader rewards the windowed credit delta covers.
+    /// Number of `leader_slots` inside the window, i.e. in `(first_slot, last_slot]`.
     pub fn leader_slots_in_window(&self, leader_slots: &[u64]) -> u64 {
-        leader_slots
-            .iter()
-            .filter(|slot| **slot > self.first_slot && **slot <= self.last_slot)
-            .count() as u64
+        leader_slots_between(leader_slots, self.first_slot, self.last_slot)
     }
 }
 
@@ -272,18 +312,22 @@ impl RewardRate {
 /// `solana_epoch_credits_rate_ratio` and `solana_epoch_credits_rate_percentile`.
 ///
 /// For every staked account present in both the oldest and the newest snapshot, the windowed
-/// credits per stake is `(credits_newest - credits_oldest) / stake_newest`. Ours is divided by
-/// the **median of these per-account values**, not by the growth of the cluster median
-/// cumulative value: under SIMD-0326 the leader of a vote aggregate is paid as much as every
-/// voter it includes, so over an epoch the median cumulative credits grow at about twice the
-/// pure voting rate, while over a 15-minute window the median validator has had no leader slot.
-/// Dividing by the growth of the cumulative median therefore reads ~0.5 for a healthy
-/// validator; the median of per-account deltas reads ~1.0.
+/// credits per stake is `(credits_newest - credits_oldest) / stake_newest`. Under SIMD-0326 the
+/// leader of a vote aggregate is paid as much as every voter it includes, so an account's
+/// windowed value is the pure voting rate plus a bump for every leader window it had inside
+/// the window. Over 15 minutes on mainnet more than half of the accounts carry such a bump
+/// and any statistic over all accounts moves into the leader tail (the median roughly
+/// doubles), while the voting rate of accounts with **no leader slot inside the window** is
+/// stable within 1 % on every network. Ours is therefore divided by the median over those
+/// zero-leader accounts, falling back to the 10th percentile of all accounts when fewer than
+/// [`MIN_REFERENCE_ACCOUNTS`] of them exist. Our own value is not filtered: our leader slots
+/// show up as spikes above 1 and are reported in `solana_leader_slots_in_window`.
 ///
 /// The epoch-to-date ratio dilutes a problem that starts mid-epoch; this one does not.
 #[derive(Debug)]
 pub struct RewardRateWindow {
     window_seconds: u64,
+    min_reference_accounts: usize,
     snapshots: VecDeque<RateSnapshot>,
 }
 
@@ -291,14 +335,25 @@ impl RewardRateWindow {
     pub fn new(window_seconds: u64) -> Self {
         Self {
             window_seconds,
+            min_reference_accounts: MIN_REFERENCE_ACCOUNTS,
             snapshots: VecDeque::new(),
         }
+    }
+
+    /// Override the size the zero-leader population must have before the p10 fallback engages.
+    #[cfg(test)]
+    pub fn with_min_reference_accounts(mut self, min_reference_accounts: usize) -> Self {
+        self.min_reference_accounts = min_reference_accounts;
+        self
     }
 
     /// Record a snapshot of `status` taken at `timestamp_secs` / `slot` in `epoch` and return
     /// our reward rate, or `None` while the window holds fewer than two snapshots, spans less
     /// than [`MIN_RATE_WINDOW_SECONDS`], we are unstaked or absent from either end of the
     /// window, or no account in the cluster earned anything over the window.
+    ///
+    /// `leader_schedule` is the current epoch's schedule by identity; an empty map treats
+    /// every account as having no leader slots.
     pub fn push(
         &mut self,
         timestamp_secs: u64,
@@ -306,6 +361,7 @@ impl RewardRateWindow {
         epoch: u64,
         status: &RpcVoteAccountStatus,
         vote_pubkey: &str,
+        leader_schedule: &LeaderSchedule,
     ) -> Option<RewardRate> {
         // Credits reset at the epoch boundary: snapshots from another epoch are useless.
         if self
@@ -330,8 +386,12 @@ impl RewardRateWindow {
             .chain(status.delinquent.iter())
             .filter(|info| info.activated_stake > 0)
             .map(|info| {
-                let credits = current_epoch_credits(info, epoch).unwrap_or(0);
-                (info.vote_pubkey.clone(), (info.activated_stake, credits))
+                let snapshot = AccountSnapshot {
+                    stake: info.activated_stake,
+                    credits: current_epoch_credits(info, epoch).unwrap_or(0),
+                    identity: info.node_pubkey.clone(),
+                };
+                (info.vote_pubkey.clone(), snapshot)
             })
             .collect();
         self.snapshots.push_back(RateSnapshot {
@@ -360,25 +420,50 @@ impl RewardRateWindow {
 
         // Windowed credits per stake of every account present at both ends of the window.
         // Accounts that earned nothing (delta <= 0) are excluded: they are delinquent, stale,
-        // or joined mid-window, and would otherwise drag the median towards zero.
-        let windowed_credits_per_stake = |pubkey: &str| -> Option<f64> {
-            let (stake, newest) = *last.accounts.get(pubkey)?;
-            let (_, oldest) = *first.accounts.get(pubkey)?;
-            Some(newest.saturating_sub(oldest) as f64 / stake as f64)
+        // or joined mid-window, and would otherwise drag the statistics towards zero.
+        let windowed_credits_per_stake = |pubkey: &str| -> Option<(f64, &AccountSnapshot)> {
+            let newest = last.accounts.get(pubkey)?;
+            let oldest = first.accounts.get(pubkey)?;
+            let rate = newest.credits.saturating_sub(oldest.credits) as f64 / newest.stake as f64;
+            Some((rate, newest))
         };
-        let mut population: Vec<f64> = last
-            .accounts
-            .keys()
-            .filter_map(|pubkey| windowed_credits_per_stake(pubkey))
-            .filter(|rate| *rate > 0.0)
-            .collect();
+        let had_leader_slot = |account: &AccountSnapshot| {
+            leader_schedule
+                .get(&account.identity)
+                .is_some_and(|slots| leader_slots_between(slots, first.slot, last.slot) > 0)
+        };
 
-        let ours = windowed_credits_per_stake(vote_pubkey)?;
+        let mut population: Vec<f64> = Vec::new();
+        let mut reference: Vec<f64> = Vec::new();
+        for pubkey in last.accounts.keys() {
+            let Some((rate, account)) = windowed_credits_per_stake(pubkey) else {
+                continue;
+            };
+            if rate <= 0.0 {
+                continue;
+            }
+            population.push(rate);
+            if !had_leader_slot(account) {
+                reference.push(rate);
+            }
+        }
+
+        let (ours, _) = windowed_credits_per_stake(vote_pubkey)?;
         let percentile = percentile(ours, &population)?;
-        let median = median(&mut population)?;
+        let reference_accounts = reference.len() as u64;
+        let (reference, denominator) = if reference.len() >= self.min_reference_accounts {
+            (RateReference::ZeroLeaderMedian, median(&mut reference)?)
+        } else {
+            (
+                RateReference::AllAccountsP10,
+                percentile_value(&mut population, 10)?,
+            )
+        };
         Some(RewardRate {
-            ratio: ours / median,
+            ratio: ours / denominator,
             percentile,
+            reference,
+            reference_accounts,
             first_slot: first.slot,
             last_slot: last.slot,
         })
@@ -692,12 +777,25 @@ mod tests {
         (STEADY, 1_200),
     ];
 
+    fn no_leaders() -> LeaderSchedule {
+        LeaderSchedule::new()
+    }
+
+    /// Window whose zero-leader reference is accepted at any size, so the five-account
+    /// fixture is measured against its median rather than the p10 fallback.
+    fn lenient_window(window_seconds: u64) -> RewardRateWindow {
+        RewardRateWindow::new(window_seconds).with_min_reference_accounts(1)
+    }
+
     #[test]
     fn rate_ratio_needs_two_snapshots_15_minutes_apart() {
-        let mut window = RewardRateWindow::new(900);
+        let mut window = lenient_window(900);
         let start = five_accounts();
         // Single snapshot: no sample.
-        assert_eq!(window.push(1_000, SLOT, EPOCH, &start, OURS), None);
+        assert_eq!(
+            window.push(1_000, SLOT, EPOCH, &start, OURS, &no_leaders()),
+            None
+        );
         assert_eq!(window.len(), 1);
         // 15 min later. Windowed credits per stake: Slow 0.002, Big/Small 0.005,
         // Steady 0.006, ours 625 / 100_000 = 0.00625. Median of the five = 0.005.
@@ -712,7 +810,7 @@ mod tests {
             ],
         );
         let rate = window
-            .push(1_900, SLOT + 4_500, EPOCH, &later, OURS)
+            .push(1_900, SLOT + 4_500, EPOCH, &later, OURS, &no_leaders())
             .unwrap();
         assert_close(Some(rate.ratio), 1.25);
         // Strictly below 0.00625: Slow, Big, Small, Steady => 4 of 5.
@@ -729,16 +827,16 @@ mod tests {
         // its windowed credits per stake jumps from 0.005 to 0.105.
         let jump = advanced(&quiet, &[(BIG, 50_000)]);
 
-        let mut quiet_window = RewardRateWindow::new(900);
-        quiet_window.push(0, SLOT, EPOCH, &start, OURS);
+        let mut quiet_window = lenient_window(900);
+        quiet_window.push(0, SLOT, EPOCH, &start, OURS, &no_leaders());
         let quiet_rate = quiet_window
-            .push(900, SLOT + 4_500, EPOCH, &quiet, OURS)
+            .push(900, SLOT + 4_500, EPOCH, &quiet, OURS, &no_leaders())
             .unwrap();
 
-        let mut jump_window = RewardRateWindow::new(900);
-        jump_window.push(0, SLOT, EPOCH, &start, OURS);
+        let mut jump_window = lenient_window(900);
+        jump_window.push(0, SLOT, EPOCH, &start, OURS, &no_leaders());
         let jump_rate = jump_window
-            .push(900, SLOT + 4_500, EPOCH, &jump, OURS)
+            .push(900, SLOT + 4_500, EPOCH, &jump, OURS, &no_leaders())
             .unwrap();
 
         // Sorted without the jump: 0.002, 0.005, 0.005, 0.005, 0.006 => median 0.005.
@@ -749,10 +847,10 @@ mod tests {
         assert_eq!(jump_rate.percentile, 20.0);
 
         // Big's own ratio does spike for this window: 0.105 / 0.005.
-        let mut big_window = RewardRateWindow::new(900);
-        big_window.push(0, SLOT, EPOCH, &start, BIG);
+        let mut big_window = lenient_window(900);
+        big_window.push(0, SLOT, EPOCH, &start, BIG, &no_leaders());
         let big_rate = big_window
-            .push(900, SLOT + 4_500, EPOCH, &jump, BIG)
+            .push(900, SLOT + 4_500, EPOCH, &jump, BIG, &no_leaders())
             .unwrap();
         assert_close(Some(big_rate.ratio), 21.0);
         assert_eq!(big_rate.percentile, 80.0);
@@ -760,12 +858,18 @@ mod tests {
 
     #[test]
     fn rate_ratio_waits_for_the_minimum_span() {
-        let mut window = RewardRateWindow::new(900);
+        let mut window = lenient_window(900);
         let start = five_accounts();
-        assert_eq!(window.push(1_000, SLOT, EPOCH, &start, OURS), None);
+        assert_eq!(
+            window.push(1_000, SLOT, EPOCH, &start, OURS, &no_leaders()),
+            None
+        );
         // 30 s later: two snapshots but under the 60 s minimum.
         let mid = advanced(&start, STEP);
-        assert_eq!(window.push(1_030, SLOT + 150, EPOCH, &mid, OURS), None);
+        assert_eq!(
+            window.push(1_030, SLOT + 150, EPOCH, &mid, OURS, &no_leaders()),
+            None
+        );
         // 60 s after the first snapshot: reported, over the whole window. Ours earned
         // 500 + 1_000 on 100_000 = 0.015; everyone else earned two steps => median 0.010.
         let end = advanced(
@@ -778,19 +882,21 @@ mod tests {
                 (STEADY, 1_200),
             ],
         );
-        let rate = window.push(1_060, SLOT + 300, EPOCH, &end, OURS).unwrap();
+        let rate = window
+            .push(1_060, SLOT + 300, EPOCH, &end, OURS, &no_leaders())
+            .unwrap();
         assert_close(Some(rate.ratio), 1.5);
     }
 
     #[test]
     fn rate_ratio_slides_and_resets_on_epoch_change() {
-        let mut window = RewardRateWindow::new(900);
+        let mut window = lenient_window(900);
         let t0 = five_accounts();
         let t600 = advanced(&t0, STEP);
         let t1200 = advanced(&t600, STEP);
-        window.push(0, SLOT, EPOCH, &t0, OURS);
-        window.push(600, SLOT + 3_000, EPOCH, &t600, OURS);
-        window.push(1_200, SLOT + 6_000, EPOCH, &t1200, OURS);
+        window.push(0, SLOT, EPOCH, &t0, OURS, &no_leaders());
+        window.push(600, SLOT + 3_000, EPOCH, &t600, OURS, &no_leaders());
+        window.push(1_200, SLOT + 6_000, EPOCH, &t1200, OURS, &no_leaders());
         // t=0 is outside the window but stays as the boundary snapshot, so the covered span
         // (1200 s) is at least the configured 900 s.
         assert_eq!(window.len(), 3);
@@ -808,7 +914,7 @@ mod tests {
             ],
         );
         let rate = window
-            .push(1_800, SLOT + 9_000, EPOCH, &t1800, OURS)
+            .push(1_800, SLOT + 9_000, EPOCH, &t1800, OURS, &no_leaders())
             .unwrap();
         assert_eq!(window.len(), 3);
         assert_close(Some(rate.ratio), 0.75);
@@ -816,7 +922,7 @@ mod tests {
 
         // New epoch: history is discarded and no sample is reported.
         assert_eq!(
-            window.push(2_400, SLOT + 12_000, EPOCH + 1, &t1800, OURS),
+            window.push(2_400, SLOT + 12_000, EPOCH + 1, &t1800, OURS, &no_leaders()),
             None
         );
         assert_eq!(window.len(), 1);
@@ -826,7 +932,7 @@ mod tests {
     fn minimum_window_emits_with_realistic_poll_spacing() {
         // reward_window_seconds at its minimum of 60 with snapshots every 35 s
         // (30 s sleep plus the loop's own RPC time) must still produce samples.
-        let mut window = RewardRateWindow::new(60);
+        let mut window = lenient_window(60);
         let mut status = five_accounts();
         let mut emitted = Vec::new();
         for i in 0..6u64 {
@@ -838,7 +944,7 @@ mod tests {
                     &[(OURS, 35), (BIG, 175), (SMALL, 7), (SLOW, 35), (STEADY, 70)],
                 );
             }
-            emitted.push(window.push(t, SLOT + t * 5, EPOCH, &status, OURS));
+            emitted.push(window.push(t, SLOT + t * 5, EPOCH, &status, OURS, &no_leaders()));
         }
         // First sample at t=70 (span 70 s >= 60), then every push.
         assert_eq!(emitted[0], None);
@@ -853,14 +959,16 @@ mod tests {
     #[test]
     fn stalled_validator_reads_zero_not_absent() {
         // Ours stops earning while the cluster keeps going: the alertable case.
-        let mut window = RewardRateWindow::new(900);
+        let mut window = lenient_window(900);
         let start = five_accounts();
-        window.push(0, SLOT, EPOCH, &start, OURS);
+        window.push(0, SLOT, EPOCH, &start, OURS, &no_leaders());
         let later = advanced(
             &start,
             &[(BIG, 2_500), (SMALL, 100), (SLOW, 200), (STEADY, 1_200)],
         );
-        let rate = window.push(900, SLOT + 4_500, EPOCH, &later, OURS).unwrap();
+        let rate = window
+            .push(900, SLOT + 4_500, EPOCH, &later, OURS, &no_leaders())
+            .unwrap();
         assert_eq!(rate.ratio, 0.0);
         assert_eq!(rate.percentile, 0.0);
     }
@@ -868,8 +976,8 @@ mod tests {
     #[test]
     fn accounts_without_earnings_or_history_are_excluded_from_the_median() {
         let start = fixture();
-        let mut window = RewardRateWindow::new(900);
-        window.push(0, SLOT, EPOCH, &start, OURS);
+        let mut window = lenient_window(900);
+        window.push(0, SLOT, EPOCH, &start, OURS, &no_leaders());
         // Steady appears only in the newest snapshot (missing from the oldest) with a huge
         // credit count; Stale is staked but earned nothing; Zero is unstaked.
         let mut later = advanced(&start, STEP);
@@ -878,7 +986,9 @@ mod tests {
         steady.activated_stake = 1_000;
         steady.epoch_credits = vec![(EPOCH, 1_000_000, 0)];
         later.current.push(steady);
-        let rate = window.push(900, SLOT + 4_500, EPOCH, &later, OURS).unwrap();
+        let rate = window
+            .push(900, SLOT + 4_500, EPOCH, &later, OURS, &no_leaders())
+            .unwrap();
         // Population: Ours 0.005, Big 0.005, Small 0.005, Slow 0.002 => median 0.005.
         assert_close(Some(rate.ratio), 1.0);
         assert_eq!(rate.percentile, 25.0);
@@ -890,13 +1000,14 @@ mod tests {
         let later = advanced(&start, STEP);
 
         // Unstaked account: no sample, but the cluster snapshot is still recorded.
-        let mut window = RewardRateWindow::new(900);
+        let mut window = lenient_window(900);
         window.push(
             0,
             SLOT,
             EPOCH,
             &start,
             "Zero1111111111111111111111111111111111111111",
+            &no_leaders(),
         );
         assert_eq!(
             window.push(
@@ -904,24 +1015,28 @@ mod tests {
                 SLOT + 4_500,
                 EPOCH,
                 &later,
-                "Zero1111111111111111111111111111111111111111"
+                "Zero1111111111111111111111111111111111111111",
+                &no_leaders()
             ),
             None
         );
         assert_eq!(window.len(), 2);
 
         // Account not in the response.
-        let mut window = RewardRateWindow::new(900);
-        window.push(0, SLOT, EPOCH, &start, "Nobody");
+        let mut window = lenient_window(900);
+        window.push(0, SLOT, EPOCH, &start, "Nobody", &no_leaders());
         assert_eq!(
-            window.push(900, SLOT + 4_500, EPOCH, &later, "Nobody"),
+            window.push(900, SLOT + 4_500, EPOCH, &later, "Nobody", &no_leaders()),
             None
         );
 
         // Nobody in the cluster earned anything: no median rather than a division by zero.
-        let mut window = RewardRateWindow::new(900);
-        window.push(0, SLOT, EPOCH, &start, OURS);
-        assert_eq!(window.push(900, SLOT + 4_500, EPOCH, &start, OURS), None);
+        let mut window = lenient_window(900);
+        window.push(0, SLOT, EPOCH, &start, OURS, &no_leaders());
+        assert_eq!(
+            window.push(900, SLOT + 4_500, EPOCH, &start, OURS, &no_leaders()),
+            None
+        );
     }
 
     #[test]
@@ -929,6 +1044,8 @@ mod tests {
         let rate = RewardRate {
             ratio: 1.0,
             percentile: 50.0,
+            reference: RateReference::ZeroLeaderMedian,
+            reference_accounts: 3,
             first_slot: 1_000,
             last_slot: 5_500,
         };
@@ -938,5 +1055,126 @@ mod tests {
             2
         );
         assert_eq!(rate.leader_slots_in_window(&[]), 0);
+    }
+
+    /// Big and Steady had leader slots inside the window (SLOT, SLOT + 4_500] and earned 3x;
+    /// Small's only leader slot is exactly at the oldest snapshot's slot, so it does not count.
+    fn leaders_in_window() -> LeaderSchedule {
+        LeaderSchedule::from([
+            (
+                "BigIdentity111111111111111111111111111111111".to_string(),
+                vec![SLOT + 4, SLOT + 5, SLOT + 6, SLOT + 7],
+            ),
+            (
+                "SteadyIdentity111111111111111111111111111111".to_string(),
+                vec![SLOT + 4_500],
+            ),
+            (
+                "SmallIdentity1111111111111111111111111111111".to_string(),
+                vec![SLOT, SLOT + 4_501],
+            ),
+        ])
+    }
+
+    /// One 15-minute step where Big and Steady also collected leader rewards:
+    /// Ours 0.005, Small 0.005, Slow 0.002, Big 0.015, Steady 0.018.
+    const STEP_WITH_LEADERS: &[(&str, u64)] = &[
+        (OURS, 500),
+        (BIG, 7_500),
+        (SMALL, 100),
+        (SLOW, 200),
+        (STEADY, 3_600),
+    ];
+
+    #[test]
+    fn accounts_with_leader_slots_in_window_are_excluded_from_the_reference() {
+        let start = five_accounts();
+        let later = advanced(&start, STEP_WITH_LEADERS);
+        let mut window = lenient_window(900);
+        window.push(0, SLOT, EPOCH, &start, OURS, &leaders_in_window());
+        let rate = window
+            .push(900, SLOT + 4_500, EPOCH, &later, OURS, &leaders_in_window())
+            .unwrap();
+        // Reference: Ours, Small, Slow => median 0.005. Over all five accounts the median
+        // would be 0.005 too here, but with the 3x jumps the mean-of-middle shifts as soon as
+        // the leader accounts make up half of the population; see the fallback test below.
+        assert_eq!(rate.reference, RateReference::ZeroLeaderMedian);
+        assert_eq!(rate.reference_accounts, 3);
+        assert_close(Some(rate.ratio), 1.0);
+        // The percentile still ranks us among all five: only Slow is strictly below.
+        assert_eq!(rate.percentile, 20.0);
+
+        // Without the schedule the leader bumps enter the reference and the ratio drops:
+        // median of [0.002, 0.005, 0.005, 0.015, 0.018] is still 0.005 with five accounts,
+        // so make Small a leader too to show the effect: median becomes 0.015.
+        let mut three_leaders = leaders_in_window();
+        three_leaders.insert(
+            "SmallIdentity1111111111111111111111111111111".to_string(),
+            vec![SLOT + 10],
+        );
+        let later = advanced(
+            &start,
+            &[
+                (OURS, 500),
+                (BIG, 7_500),
+                (SMALL, 300),
+                (SLOW, 200),
+                (STEADY, 3_600),
+            ],
+        );
+        let mut filtered = lenient_window(900);
+        filtered.push(0, SLOT, EPOCH, &start, OURS, &three_leaders);
+        let filtered_rate = filtered
+            .push(900, SLOT + 4_500, EPOCH, &later, OURS, &three_leaders)
+            .unwrap();
+        let mut unfiltered = lenient_window(900);
+        unfiltered.push(0, SLOT, EPOCH, &start, OURS, &no_leaders());
+        let unfiltered_rate = unfiltered
+            .push(900, SLOT + 4_500, EPOCH, &later, OURS, &no_leaders())
+            .unwrap();
+        // Reference Ours 0.005 and Slow 0.002 => median 0.0035; ours / 0.0035.
+        assert_eq!(filtered_rate.reference_accounts, 2);
+        assert_close(Some(filtered_rate.ratio), 0.005 / 0.0035);
+        // All five: median of [0.002, 0.005, 0.015, 0.015, 0.018] = 0.015 => 1/3.
+        assert_close(Some(unfiltered_rate.ratio), 1.0 / 3.0);
+    }
+
+    #[test]
+    fn p10_of_all_accounts_is_used_when_the_zero_leader_population_is_small() {
+        let start = five_accounts();
+        let later = advanced(&start, STEP_WITH_LEADERS);
+        // Default threshold (50): three zero-leader accounts are not enough.
+        let mut window = RewardRateWindow::new(900);
+        window.push(0, SLOT, EPOCH, &start, OURS, &leaders_in_window());
+        let rate = window
+            .push(900, SLOT + 4_500, EPOCH, &later, OURS, &leaders_in_window())
+            .unwrap();
+        assert_eq!(rate.reference, RateReference::AllAccountsP10);
+        assert_eq!(rate.reference_accounts, 3);
+        // p10 of [0.002, 0.005, 0.005, 0.015, 0.018] by nearest rank is the lowest value.
+        assert_close(Some(rate.ratio), 0.005 / 0.002);
+        assert_eq!(rate.percentile, 20.0);
+
+        // Exactly at the threshold the median is used again.
+        let mut window = RewardRateWindow::new(900).with_min_reference_accounts(3);
+        window.push(0, SLOT, EPOCH, &start, OURS, &leaders_in_window());
+        let rate = window
+            .push(900, SLOT + 4_500, EPOCH, &later, OURS, &leaders_in_window())
+            .unwrap();
+        assert_eq!(rate.reference, RateReference::ZeroLeaderMedian);
+        assert_close(Some(rate.ratio), 1.0);
+    }
+
+    #[test]
+    fn percentile_value_uses_nearest_rank() {
+        assert_eq!(percentile_value(&mut [], 10), None);
+        assert_eq!(percentile_value(&mut [3.0], 10), Some(3.0));
+        let mut ten: Vec<f64> = (1..=10).map(|v| v as f64).collect();
+        assert_eq!(percentile_value(&mut ten, 10), Some(1.0));
+        assert_eq!(percentile_value(&mut ten, 50), Some(5.0));
+        assert_eq!(percentile_value(&mut ten, 100), Some(10.0));
+        let mut twenty: Vec<f64> = (1..=20).rev().map(|v| v as f64).collect();
+        assert_eq!(percentile_value(&mut twenty, 10), Some(2.0));
+        assert_eq!(percentile_value(&mut twenty, 0), Some(1.0));
     }
 }
